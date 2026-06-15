@@ -23,7 +23,7 @@ Martin Kleppmann의 *Designing Data-Intensive Applications* (DDIA)를 챕터별�
 
 ### Part I — Foundations of Data Systems
 - [x] [Ch1. Reliable, Scalable, and Maintainable Applications](notes/ch01-reliable-scalable-maintainable.md)
-- [ ] Ch2. Data Models and Query Languages
+- [x] [Ch2. Data Models and Query Languages](notes/ch02-data-models-query-languages.md)
 - [ ] Ch3. Storage and Retrieval
 - [ ] Ch4. Encoding and Evolution
 
