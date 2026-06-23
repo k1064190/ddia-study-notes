@@ -25,7 +25,7 @@ Martin Kleppmann의 *Designing Data-Intensive Applications* (DDIA)를 챕터별�
 - [x] [Ch1. Reliable, Scalable, and Maintainable Applications](notes/ch01-reliable-scalable-maintainable.md)
 - [x] [Ch2. Data Models and Query Languages](notes/ch02-data-models-query-languages.md)
 - [x] [Ch3. Storage and Retrieval](notes/ch03-storage-and-retrieval.md)
-- [ ] Ch4. Encoding and Evolution
+- [x] [Ch4. Encoding and Evolution](notes/ch04-encoding-and-evolution.md)
 
 ### Part II — Distributed Data
 - [ ] Ch5. Replication
