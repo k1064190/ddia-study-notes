@@ -1,0 +1,939 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch7. Transactions — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+        <a href="ch07.html" class="active">Ch7</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch7. Transactions</h1>
+      <p class="subtitle">
+        온갖 fault와 동시성 문제를 <strong>abort 하나로 단순화</strong>하는
+        추상화 — ACID의 미끄러운 의미, weak isolation의 함정들, 그리고
+        serializability의 세 가지 구현
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        Transaction(트랜잭션)은
+        <strong>여러 읽기·쓰기를 하나의 논리적 단위로 묶는</strong> 방법이다.
+        전체가 성공(commit)하거나 전체가 실패(abort, rollback)한다 — 부분 실패가
+        없으므로 애플리케이션은 "어중간하게 반쯤 적용된 상태"를 걱정할 필요가
+        없다.
+      </p>
+      <p>
+        데이터 시스템에서는 온갖 것이 잘못될 수 있다: 쓰기 도중 DB·애플리케이션
+        crash, 네트워크 단절, 여러 클라이언트의 동시 쓰기, 부분적으로만 갱신된
+        데이터 읽기, race condition 버그. 트랜잭션은 이런 문제들을
+        <strong>애플리케이션이 아니라 DB가 흡수</strong>해 프로그래밍 모델을
+        단순화하는, 수십 년간 다듬어진 추상화다. 다만 공짜가 아니다 — 이 챕터는
+        트랜잭션이 주는 보장(ACID), 그 보장이 실제로는 얼마나 약한지(weak
+        isolation levels), 그리고 완전한 보장(serializability)을 구현하는 세
+        가지 방법을 다룬다.
+      </p>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>ACID의 미끄러운 의미</h3>
+      <blockquote>
+        오늘날 "ACID 호환"이라는 말은 기술 용어라기보다
+        <strong>마케팅 용어에 가깝다</strong> — DB마다 구현이 제각각이고, 특히
+        isolation의 의미가 모호하다. ACID가 아닌 시스템을 BASE(Basically
+        Available, Soft state, Eventual consistency)라 부르지만, 이는 "ACID가
+        아닌 모든 것"이라는 뜻일 뿐 더 모호하다.
+      </blockquote>
+      <table>
+        <thead>
+          <tr>
+            <th>글자</th>
+            <th>실제 의미</th>
+            <th>주의점</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Atomicity</strong></td>
+            <td>
+              fault(crash, 네트워크 단절 등) 시 트랜잭션의 쓰기를 전부
+              취소(abort)할 수 있음 —
+              <strong>abortability, all-or-nothing</strong>
+            </td>
+            <td>
+              <strong>동시성과는 무관</strong>하다 (동시성은 Isolation의 몫).
+              abort 덕분에 안전한 재시도가 가능해진다
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Consistency</strong></td>
+            <td>
+              데이터에 대한
+              <strong>애플리케이션 수준의 불변식(invariant)</strong>(예: 회계
+              장부의 대차 일치)이 항상 참
+            </td>
+            <td>
+              불변식을 지키는 것은 <strong>애플리케이션의 책임</strong> — DB는
+              저장할 뿐. "C는 사실 ACID에 속하지 않는다"; Joe Hellerstein에
+              따르면 acronym을 만들려고 끼워 넣어진 글자다
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Isolation</strong></td>
+            <td>
+              동시 트랜잭션이 서로를 방해하지 않음 — 교과서적 이상은
+              <strong>serializability</strong>(순차 실행과 같은 결과)
+            </td>
+            <td>
+              성능 비용 때문에 serializable은
+              <strong>기본값인 경우가 드물고</strong>, 실무는 대부분 더 약한
+              격리 수준을 쓴다
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Durability</strong></td>
+            <td>
+              commit된 데이터는 crash에도 보존 — 디스크 쓰기 +
+              <strong>WAL</strong> + <strong>fsync</strong>, 복제 시스템에서는
+              다른 노드로의 복제
+            </td>
+            <td>
+              디스크·펌웨어 버그, 백업 손상, 전 replica 동시 장애를 생각하면
+              <strong>완벽한 durability는 존재하지 않는다</strong> — 기법을 겹쳐
+              위험을 줄일 뿐
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Single-object vs Multi-object 연산</h3>
+      <ul>
+        <li>
+          <strong>Single-object</strong>: 하나의 객체 쓰기도 원자성이 필요하다
+          (20KB JSON을 쓰다 전원이 나가면?). storage engine은 crash 복구용 log와
+          객체별 lock으로 단일 객체 수준을 보장하고, increment, compare-and-set
+          같은 <strong>단일 객체 원자 연산</strong>도 제공한다 — 하지만 이것은
+          진짜 의미의 "트랜잭션"이 아니다.
+        </li>
+        <li>
+          <strong>Multi-object transaction이 필요한 이유</strong>:
+          <strong>foreign key</strong> 참조의 유효성,
+          <strong>denormalization</strong>된 데이터의 동반 갱신,
+          <strong>secondary index</strong>와 원본의 동기화(인덱스도 사실상
+          별도의 객체다). 트랜잭션 없이도 구현은 가능하지만 오류 처리가 극도로
+          복잡해진다.
+        </li>
+        <li>
+          <strong>오류와 abort 처리</strong> — 재시도의 함정: commit은
+          성공했는데 <strong>확인 응답만 유실</strong>되면 재시도로 두 번
+          실행된다(exactly-once 문제); 과부하가 원인이면 재시도가 상황을
+          악화(backoff 필요); <strong>일시적(transient)</strong> 오류(deadlock,
+          failover)만 재시도 가치가 있고
+          <strong>영구적(permanent)</strong> 오류(제약 위반)는 무의미; DB 바깥의
+          side effect(이메일 발송)는 재시도 시 반복될 수 있다.
+        </li>
+      </ul>
+
+      <h3>Weak Isolation 1 — Read Committed</h3>
+      <ul>
+        <li>
+          <strong>No dirty reads</strong>: commit되지 않은 데이터를 읽을 수 없다
+          — 커밋 전의 부분 상태(이메일은 보이는데 unread counter는 아직)나 곧
+          abort될 데이터를 보는 것을 방지.
+        </li>
+        <li>
+          <strong>No dirty writes</strong>: commit되지 않은 데이터를 덮어쓸 수
+          없다 — 두 트랜잭션의 쓰기가 뒤섞이는 것(중고차 구매: listings는 Bob,
+          invoices는 Alice)을 방지.
+        </li>
+        <li>
+          <strong>구현</strong>: dirty write는
+          <strong>row-level write lock</strong>(commit/abort까지 보유)으로
+          막는다. dirty read는 read lock 대신
+          <strong>쓰는 중인 객체의 이전 committed 값을 기억해 두었다가</strong>
+          읽기에는 그 옛 값을 돌려준다 —
+          <strong>읽기가 lock을 잡지 않는다</strong>.
+        </li>
+      </ul>
+
+      <h3>Weak Isolation 2 — Snapshot Isolation과 MVCC</h3>
+      <p>
+        Read committed로도 못 막는 anomaly:
+        <strong>read skew(nonrepeatable read)</strong>. Alice의 은행 잔고 예시 —
+        계좌 두 개에 각 $500(합 $1,000), $100 이체 트랜잭션 실행 도중 두 계좌를
+        조회하면 한쪽은 이체 전($500), 다른 쪽은 이체 후($400)를 봐서 합이
+        $900으로 보인다. 각 읽기는 모두 committed 데이터였는데도! 일시적
+        현상이지만 <strong>backup</strong>(불일치가 영구화)이나
+        <strong>분석 쿼리·integrity check</strong>에서는 치명적이다.
+      </p>
+      <p>
+        해법 = <strong>Snapshot isolation</strong>: 각 트랜잭션이
+        <strong>시작 시점에 commit되어 있던 일관된 스냅샷</strong>만 읽는다
+        (PostgreSQL, MySQL InnoDB, Oracle, SQL Server). 구현 기법이
+        <strong>MVCC(multi-version concurrency control)</strong>다.
+      </p>
+      <ul>
+        <li>
+          원칙:
+          <strong
+            >readers never block writers, writers never block readers</strong
+          >.
+        </li>
+        <li>
+          객체의 <strong>여러 버전을 함께 보관</strong>: 트랜잭션마다 증가하는
+          <strong>txid</strong>, row마다 <code>created_by</code>(만든 txid)와
+          <code>deleted_by</code>(삭제 표시 txid). update는 delete + create로
+          변환, 안 보이게 된 버전은 GC가 제거.
+        </li>
+        <li>
+          <strong>인덱스 처리</strong>: 단순하게는 인덱스가 모든 버전을 가리키고
+          조회 시 비가시 버전을 거른다 (PostgreSQL은 같은 페이지 내 버전이면
+          인덱스 갱신 회피, CouchDB 등은 append-only/copy-on-write B-tree).
+        </li>
+        <li>
+          <strong>이름 혼란</strong>: SQL 표준에 snapshot isolation이 없어서
+          PostgreSQL·MySQL은 <strong>repeatable read</strong>, Oracle은
+          <strong>serializable</strong>이라 부른다(실제론 serializable이
+          아닌데도).
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — snapshot isolation의 MVCC 가시성 규칙: 어떤
+        트랜잭션에게 어떤 버전이 보이는지는 시계가 아니라 <em>txid의 대수</em>로
+        결정된다. (1) 내 시작 시점에 <strong>이미 commit된</strong> 트랜잭션이
+        만든 버전만 보인다 — 시작 당시 <em>진행 중이던</em> 트랜잭션의 쓰기는 그
+        뒤에 commit되어도 끝까지 무시한다. (2) abort된 트랜잭션의 쓰기는 무시.
+        (3) 나보다 <strong>나중에 시작한</strong> 트랜잭션의 쓰기는 commit
+        여부와 무관하게 무시. (4) 삭제도 같은 규칙 — 나중 트랜잭션이
+        <code>deleted_by</code> 표시를 해도 내 스냅샷에서는 그 row가 여전히 살아
+        있다. 이 규칙 덕분에 DB는 아무것도 잠그지 않고도 "그 순간에 세상을
+        정지시킨" 것 같은 일관된 뷰를 각 트랜잭션에게 제공한다 — 오래 걸리는
+        backup·분석 쿼리가 쓰기 트래픽과 공존할 수 있는 이유다.
+      </div>
+
+      <h3>Lost Update 방지</h3>
+      <p>
+        <strong>Lost update</strong>: 두 트랜잭션이 동시에
+        <strong>read-modify-write cycle</strong>을 수행하면 나중 쓰기가 먼저
+        쓰기를 포함하지 않은 채 덮어써 <strong>한쪽의 수정이 사라진다</strong>
+        (counter 증가, 위키 동시 편집, JSON 문서 일부 수정).
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>해법</th>
+            <th>내용</th>
+            <th>주의점</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Atomic write operations</strong></td>
+            <td>
+              <code>UPDATE counters SET value = value + 1 ...</code> — cycle
+              자체를 제거. 가능하면 항상 최선
+            </td>
+            <td>ORM이 무심코 read-modify-write 코드를 만들기 쉽다</td>
+          </tr>
+          <tr>
+            <td><strong>Explicit locking</strong></td>
+            <td><code>SELECT ... FOR UPDATE</code>로 읽을 row에 lock</td>
+            <td>lock을 잊으면 race condition — 실수하기 쉽다</td>
+          </tr>
+          <tr>
+            <td><strong>자동 감지</strong></td>
+            <td>
+              snapshot isolation과 결합, lost update 감지 시 abort + 재시도
+            </td>
+            <td>
+              PostgreSQL·Oracle·SQL Server는 지원;
+              <strong>MySQL InnoDB repeatable read는 감지 안 함</strong>
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Compare-and-set</strong></td>
+            <td>
+              <code>UPDATE ... WHERE content = '읽었던 값'</code> — 값이
+              그대로일 때만 갱신
+            </td>
+            <td>WHERE절이 옛 스냅샷을 보면 무용지물일 수 있음</td>
+          </tr>
+          <tr>
+            <td><strong>복제 환경의 충돌 해결</strong></td>
+            <td>
+              sibling 보존 + 병합; counter처럼
+              <strong>commutative</strong>한 연산은 CRDT가 자동 병합
+            </td>
+            <td>
+              lock·compare-and-set은 통하지 않음(최신 복사본이 하나가 아님);
+              <strong>LWW는 lost update를 일으키는데도 많은 DB의 기본값</strong>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Write Skew와 Phantom</h3>
+      <p>
+        <strong>Write skew</strong> — lost update의 <strong>일반화</strong>: 두
+        트랜잭션이 <strong>같은 객체들을 읽고, 서로 다른 객체를 갱신</strong>할
+        때 발생한다.
+      </p>
+      <ul>
+        <li>
+          <strong>당직 의사 예시</strong>: "최소 1명은 on-call" 규칙 아래
+          Alice와 Bob이 동시에 on-call 수를 조회(둘 다 2명 확인) → 각자
+          <strong>자기 자신의</strong> 레코드만 off-call로 갱신 → 둘 다 commit →
+          <strong>on-call 0명</strong>. snapshot isolation도 못 막는다.
+        </li>
+        <li>
+          다른 예: <strong>회의실 예약</strong>(겹침 확인 후 삽입),
+          <strong>멀티플레이어 게임</strong>(다른 말을 같은 자리로),
+          <strong>username 선점</strong>(중복 확인 후 생성), 이중 인출.
+        </li>
+        <li>
+          패턴: ① SELECT로 조건 확인 → ② 결과에 따라 ③ 쓰기 — 그 쓰기가 ①의
+          전제를 바꾼다. 다른 트랜잭션의 쓰기가 내 검색 결과를 바꾸는 효과가
+          <strong>phantom</strong>이다.
+        </li>
+        <li>
+          대응: 진짜 해법은 <strong>serializable isolation</strong>; 잠글 row가
+          있으면 <code>FOR UPDATE</code>; row가 없으면
+          <strong>materializing conflicts</strong>(충돌을 표현하는 row —
+          회의실×15분 슬롯 테이블 — 를 미리 만들어 lock 대상으로 삼기)가 있지만
+          <strong>최후의 수단</strong>이다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — write skew가 lost update와 다른 이유,
+        그리고 phantom: lost update는 두 트랜잭션이 <em>같은 객체</em>를 놓고
+        싸우는 것이라 "같은 객체에 대한 동시 read-modify-write"만 감지하면 잡을
+        수 있다(자동 감지, compare-and-set). write skew에서는 두 트랜잭션이
+        건드리는 객체가 <em>서로 다르다</em> — Alice는 Alice의 row, Bob은 Bob의
+        row. 객체 단위로 보면 충돌이 전혀 없다. 무너진 것은 두 쓰기의
+        <em>공동 전제</em>("on-call ≥ 1")다. 더 나쁜 경우가 phantom: 회의실
+        예약에서 확인한 전제는 "겹치는 예약이 <em>없다</em>"인데, 존재하지 않는
+        row에는 lock을 걸 수도, 변경 감지를 할 수도 없다. 그래서 weak isolation
+        위의 어떤 객체 단위 트릭으로도 근본 해결이 안 되고,
+        serializability(2PL의 predicate/index-range lock, 또는 SSI의 premise
+        추적)가 필요해진다. materializing conflicts는 "없는 row" 문제를 "미리
+        만들어둔 row"로 바꾸는 편법 — 동시성 제어가 데이터 모델로 새어 나오므로
+        최후의 수단이다.
+      </div>
+
+      <h3>Serializability 구현 1 — Actual Serial Execution</h3>
+      <ul>
+        <li>
+          동시성을 <strong>아예 제거</strong>: 트랜잭션을
+          <strong>단일 스레드에서 하나씩</strong> 실행 (Redis, VoltDB/H-Store).
+          배경: <strong>RAM이 싸져서</strong> 전체 데이터를 메모리에 올릴 수
+          있고, OLTP 트랜잭션은 짧고 작다.
+        </li>
+        <li>
+          <strong>Stored procedure 필수</strong>: 대화형 다중 문 트랜잭션은
+          네트워크 왕복 동안 단일 스레드가 놀게 되므로, 트랜잭션 전체 코드를
+          미리 제출해 한 번에 실행. 단점 — DB별 사투리, 디버깅·버전 관리·테스트
+          어려움, 잘못 짠 프로시저가 DB 전체를 마비 (현대 시스템은 일반 언어:
+          VoltDB는 Java, Redis는 Lua).
+        </li>
+        <li>
+          <strong>Partitioning의 한계</strong>: 파티션별 단일 스레드로 쓰기
+          확장이 가능하지만, <strong>여러 파티션에 걸치는 트랜잭션</strong>은
+          파티션 간 조율 때문에 극적으로 느리다(VoltDB 기준 초당 약 1,000건).
+          단일 파티션 워크로드에만 적합.
+        </li>
+      </ul>
+
+      <h3>Serializability 구현 2 — Two-Phase Locking (2PL)</h3>
+      <ul>
+        <li>
+          수십 년간 사실상 유일한 구현 (MySQL InnoDB·SQL Server의 serializable,
+          DB2). <strong>비관적(pessimistic)</strong> 동시성 제어.
+        </li>
+        <li>
+          객체마다 <strong>shared lock</strong>(읽기, 공유 가능)과
+          <strong>exclusive lock</strong>(쓰기, 독점) — 그리고
+          <strong>트랜잭션 끝까지 보유</strong>(획득 단계 + 해제 단계 =
+          two-phase).
+          <strong>readers block writers, writers block readers</strong> — MVCC의
+          mantra와 정반대.
+        </li>
+        <li>
+          <strong>성능 비용</strong>: lock 오버헤드 + 대기 — 느린 트랜잭션
+          하나가 뒤를 다 세워 지연이 불안정하고, <strong>deadlock</strong>이
+          잦다(DB가 감지해 한쪽 abort).
+        </li>
+        <li>
+          <strong>Phantom 대응</strong>: <strong>predicate lock</strong>(검색
+          조건 자체에 lock — 아직 없는 객체까지 커버, 대신 매칭 검사가 비쌈)
+          또는 그 근사인
+          <strong>index-range locking(next-key locking)</strong>(조건을 포함하는
+          더 넓은 인덱스 범위를 잠금 — 정밀도는 낮지만 오버헤드가 작아 대부분의
+          2PL DB가 채택).
+        </li>
+      </ul>
+
+      <h3>Serializability 구현 3 — Serializable Snapshot Isolation (SSI)</h3>
+      <ul>
+        <li>
+          2008년 등장한 <strong>낙관적(optimistic)</strong> 알고리즘 —
+          PostgreSQL 9.1+의 serializable, FoundationDB. snapshot isolation
+          기반으로 일단 실행시키고, <strong>commit 시점에</strong> 격리 위반을
+          검사해 위반이면 abort.
+        </li>
+        <li>
+          write skew의 구조 —
+          <strong
+            >읽은 전제(premise)가 commit 시점엔 더 이상 참이 아닐 수
+            있다</strong
+          >
+          — 를 두 경로로 감지: (1) <strong>stale한 MVCC 읽기</strong>(내가
+          무시했던 미commit 쓰기가 먼저 commit됨 → 내 commit 시 abort), (2)
+          <strong>과거 읽기에 영향을 주는 쓰기</strong>(누가 어떤 데이터를
+          읽었는지 기록해 두고, 쓰기 발생 시 최근에 그 데이터를 읽은
+          트랜잭션들에게 통지).
+        </li>
+        <li>
+          약점: <strong>abort 비율</strong> — 읽고-쓰는 트랜잭션이 길수록
+          충돌·abort 확률이 커져, 짧은 read-write 트랜잭션을 요구한다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — 2PL vs SSI 트레이드오프: 둘 다 완전한
+        serializability를 주지만 비용을 내는 시점이 다르다. 2PL은
+        <em>비관적</em> — 문제가 될 소지가 있으면 일단 세운다(lock 대기). 충돌이
+        실제로 잦은 워크로드에서는 헛수고가 없지만, 읽기와 쓰기가 서로를
+        블로킹하므로 느린 트랜잭션 하나가 전체 지연을 끌어올리고 deadlock 처리
+        비용도 낸다. SSI는 <em>낙관적</em> — 아무도 기다리지 않고 실행한 뒤
+        commit에서 정산한다. 트랜잭션 간 블로킹이 없어 지연이 예측 가능하고 읽기
+        전용 쿼리는 lock 없이 스냅샷 위에서 달리며, actual serial execution과
+        달리 단일 코어에 묶이지 않고 여러 파티션으로 확장할 수 있다. 대신
+        contention이 높으면 abort로 버려지는 일이 많아진다 — 같은 데이터를 놓고
+        다투는 긴 read-write 트랜잭션이 많다면 2PL이, 충돌이 드물고 짧은
+        트랜잭션 위주라면 SSI가 유리하다.
+      </div>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Atomicity — 계좌 이체 취소 버튼</h3>
+        <p>
+          이체는 "출금 + 입금" 두 동작이지만 하나로 취급된다. 중간에 정전이 나면
+          출금만 된 상태로 남는 게 아니라 <strong>없던 일</strong>이 된다.
+          원자성은 "동시에"가 아니라 "<strong
+            >전부 아니면 전무 + 취소 가능</strong
+          >"이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Consistency — 가계부 검산</h3>
+        <p>
+          "수입 − 지출 = 잔액"이라는 규칙은 가계부 앱(DB)이 아니라
+          <strong>쓰는 사람(애플리케이션)</strong>이 지켜야 한다. 앱은 적힌 대로
+          저장할 뿐, 엉터리로 적으면 엉터리로 저장된다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Dirty read — 보내다 만 이메일</h3>
+        <p>
+          친구가 편지를 쓰는 중간에 어깨너머로 읽으면(dirty read) 결론이 뒤집힌
+          문장을 오해한다. 다 쓰고 봉투에 넣은(commit) 편지만 읽어야 한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Read skew — 이사 중인 집 사진 찍기</h3>
+        <p>
+          이삿짐이 옮겨지는 도중 옛집과 새집을 시간차를 두고 찍으면, 소파가
+          <strong>양쪽 어디에도 없는</strong> 사진 세트가 나온다. snapshot
+          isolation은 "한 순간에 모든 방을 동시에 찍은" 사진을 준다 — backup이
+          꼭 이런 사진이어야 한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>MVCC — 문서의 버전 기록</h3>
+        <p>
+          문서를 고칠 때 덮어쓰지 않고 "v3(작성: 트랜잭션 12, 삭제: 트랜잭션
+          13)"처럼 <strong>버전을 쌓아둔다</strong>. 독자는 자기가 읽기 시작한
+          시점에 확정돼 있던 버전만 본다 — 작가와 독자가 서로 기다릴 필요가 없는
+          이유.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Lost update — 위키 동시 편집</h3>
+        <p>
+          두 사람이 같은 문단을 복사해 각자 고친 뒤 차례로 붙여넣으면, 나중에
+          붙여넣은 사람이 앞사람의 수정을 통째로 날린다. 해법은 "문단 잠그고
+          고치기(lock)" 또는 "붙여넣기 전 원본이 그대로인지
+          확인(compare-and-set)".
+        </p>
+      </div>
+      <div class="card">
+        <h3>Write skew — 당직 맞교대의 함정</h3>
+        <p>
+          의사 둘이 <strong>동시에</strong> 당직표를 보고 "나 말고도 한 명 있네"
+          하고 각자 빠진다 → 당직 0명. 서로 <strong>다른</strong> 줄(자기
+          이름)만 고쳤기 때문에 lost update 감지에도 안 걸린다. 쓰기가 겹친 게
+          아니라 <strong>서로의 전제를 무너뜨린 것</strong>이 문제.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Phantom — 없는 자리에는 자물쇠를 못 건다</h3>
+        <p>
+          회의실 예약에서 잠가야 할 것은 "겹치는 예약이 없다는 사실"인데, 없는
+          row에는 lock을 걸 수 없다. materializing conflicts는 시간 슬롯이라는
+          <strong>가짜 좌석표를 미리 만들어</strong> 거기에 자물쇠를 거는
+          편법이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Actual serial execution — 창구 하나인 은행</h3>
+        <p>
+          창구가 하나면 줄이 생기지만 새치기 문제(동시성 버그)는 원천 차단된다.
+          단, 손님이 창구 앞에서 전화 통화(대화형 쿼리)를 하면 안 되고, 용건을
+          <strong>미리 쪽지에 적어(stored procedure)</strong>
+          와야 한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>2PL vs SSI — 검문 vs 사후 심사</h3>
+        <p>
+          2PL은 출입문마다 검문(lock)해서 충돌을 <strong>사전에</strong>
+          막는다 — 안전하지만 줄이 길다. SSI는 자유롭게 통과시키고 출국
+          심사(commit) 때 문제가 발견되면
+          <strong>되돌려보낸다(abort)</strong> — 보통은 빠르지만, 위반자가
+          많으면(높은 contention) 헛걸음이 많아진다.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Transaction</strong></td>
+            <td>
+              여러 읽기·쓰기를 하나의 논리적 단위로 묶어 전체 commit 또는 전체
+              abort
+            </td>
+          </tr>
+          <tr>
+            <td><strong>ACID</strong></td>
+            <td>
+              Atomicity·Consistency·Isolation·Durability — 구현이 제각각이라
+              사실상 마케팅 용어화
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Atomicity</strong></td>
+            <td>
+              fault 시 트랜잭션 전체를 취소할 수 있음 (abortability,
+              all-or-nothing)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Consistency</strong></td>
+            <td>
+              애플리케이션 수준 불변식 유지 — DB가 아닌 애플리케이션의 책임
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Isolation</strong></td>
+            <td>
+              동시 트랜잭션이 서로를 방해하지 않음 — 이상은 serializability
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Durability</strong></td>
+            <td>
+              commit된 데이터는 crash에도 보존 (WAL, fsync, 복제) — 완벽한
+              durability는 없음
+            </td>
+          </tr>
+          <tr>
+            <td><strong>BASE</strong></td>
+            <td>
+              Basically Available, Soft state, Eventual consistency — "ACID가
+              아님"의 모호한 표현
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Dirty read / Dirty write</strong></td>
+            <td>commit되지 않은 데이터를 읽음 / 덮어씀</td>
+          </tr>
+          <tr>
+            <td><strong>Read committed</strong></td>
+            <td>
+              dirty read·dirty write를 막는 기본 격리 수준 (write lock + 옛 값
+              반환)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Read skew (nonrepeatable read)</strong></td>
+            <td>
+              한 트랜잭션 안에서 시점이 다른 데이터를 섞어 봐서 생기는 불일치
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Snapshot isolation</strong></td>
+            <td>트랜잭션이 시작 시점의 일관된 스냅샷만 읽는 격리 수준</td>
+          </tr>
+          <tr>
+            <td><strong>MVCC</strong></td>
+            <td>
+              객체의 여러 버전을 보관해 lock 없이 일관된 읽기를 제공하는 기법
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Visibility rules</strong></td>
+            <td>
+              어떤 버전이 어떤 트랜잭션에게 보이는지 정하는 규칙 (txid,
+              created_by/deleted_by 기반)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Lost update</strong></td>
+            <td>동시 read-modify-write로 한쪽의 수정이 덮어써져 사라짐</td>
+          </tr>
+          <tr>
+            <td><strong>Atomic write operation</strong></td>
+            <td>
+              <code>SET value = value + 1</code> 등 read-modify-write를 제거하는
+              원자 연산
+            </td>
+          </tr>
+          <tr>
+            <td><strong>FOR UPDATE</strong></td>
+            <td>읽는 row에 명시적 lock을 거는 SQL 절</td>
+          </tr>
+          <tr>
+            <td><strong>Compare-and-set</strong></td>
+            <td>읽었던 값이 그대로일 때만 갱신을 허용하는 조건부 쓰기</td>
+          </tr>
+          <tr>
+            <td><strong>Write skew</strong></td>
+            <td>
+              같은 것을 읽고 서로 다른 객체를 고쳐 전제를 무너뜨림 — lost
+              update의 일반화
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Phantom</strong></td>
+            <td>
+              한 트랜잭션의 쓰기가 다른 트랜잭션의 검색 결과를 바꾸는 효과
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Materializing conflicts</strong></td>
+            <td>
+              충돌을 표현하는 row를 미리 만들어 lock 대상으로 삼는 최후의 수단
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Serializability</strong></td>
+            <td>
+              동시 실행 결과가 어떤 순차 실행과 동일함을 보장하는 가장 강한 격리
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Actual serial execution</strong></td>
+            <td>단일 스레드로 트랜잭션을 하나씩 실행 (Redis, VoltDB)</td>
+          </tr>
+          <tr>
+            <td><strong>Stored procedure</strong></td>
+            <td>트랜잭션 코드 전체를 DB에 미리 제출해 한 번에 실행</td>
+          </tr>
+          <tr>
+            <td><strong>2PL (Two-Phase Locking)</strong></td>
+            <td>
+              shared/exclusive lock을 트랜잭션 끝까지 보유하는 비관적
+              serializability 구현
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Shared / Exclusive lock</strong></td>
+            <td>여럿이 공유하는 읽기 lock / 독점하는 쓰기 lock</td>
+          </tr>
+          <tr>
+            <td><strong>Deadlock</strong></td>
+            <td>
+              트랜잭션들이 서로의 lock을 기다리며 교착 — DB가 감지해 한쪽을
+              abort
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Predicate lock</strong></td>
+            <td>
+              검색 조건 자체에 거는 lock — 아직 없는 객체(phantom)까지 커버
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Index-range lock (next-key lock)</strong></td>
+            <td>predicate lock의 근사 — 조건을 포함한 인덱스 범위를 잠금</td>
+          </tr>
+          <tr>
+            <td><strong>SSI</strong></td>
+            <td>
+              snapshot isolation 위에서 commit 시 stale premise를 감지해
+              abort하는 낙관적 serializability
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Optimistic / Pessimistic</strong></td>
+            <td>
+              일단 실행하고 문제 시 abort / 문제 소지가 있으면 미리 대기(lock)
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        트랜잭션은 온갖 fault와 동시성 문제를
+        <strong>abort 하나로 단순화</strong>하는 추상화다 — 하지만 ACID의
+        I(격리)는 실무에서 대부분 약하다(read committed는 dirty read/write만,
+        snapshot isolation(MVCC)도 lost update 일부와 write skew·phantom은 못
+        막는다). 완전한 serializability는
+        <strong>단일 스레드 실행, 2PL(비관적), SSI(낙관적)</strong> 셋 중 하나로
+        구현한다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch06.html">← Ch6. Partitioning</a
+        ><a href="index.html">목차 →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "ACID의 Atomicity(원자성)가 실제로 의미하는 것은?",
+          options: [
+            "여러 트랜잭션이 동시에 실행되어도 서로 간섭하지 않음",
+            "fault 발생 시 트랜잭션의 쓰기를 전부 취소(abort)할 수 있음",
+            "commit된 데이터가 영구히 보존됨",
+            "모든 replica가 같은 값을 가짐",
+          ],
+          answer: 1,
+          expl: "Atomicity는 동시성과 무관하다. fault 시 전체 취소가 가능하다는 abortability, all-or-nothing 보장이다. 첫 번째는 Isolation, 세 번째는 Durability.",
+        },
+        {
+          type: "mcq",
+          q: '"C는 사실 ACID에 속하지 않는다"는 말의 근거는?',
+          options: [
+            "Consistency는 성능 때문에 아무도 구현하지 않아서",
+            "불변식(invariant)을 지키는 것은 DB가 아니라 애플리케이션의 책임이라서",
+            "Consistency가 Isolation과 동의어라서",
+            "SQL 표준에서 삭제되었기 때문에",
+          ],
+          answer: 1,
+          expl: "불변식을 지키도록 트랜잭션을 올바르게 짜는 것은 애플리케이션의 몫. Joe Hellerstein에 따르면 C는 acronym을 만들려고 끼워 넣어진 글자다.",
+        },
+        {
+          type: "mcq",
+          q: '오늘날 "ACID 호환"이라는 표현에 대한 책의 평가는?',
+          options: [
+            "정확한 기술 표준을 가리킨다",
+            "DB마다 구현이 제각각이라 사실상 마케팅 용어에 가깝다",
+            "NoSQL에는 적용될 수 없다",
+            "serializability를 항상 보장한다는 뜻이다",
+          ],
+          answer: 1,
+          expl: "isolation의 의미가 DB마다 달라 보장 내용이 모호하므로, ACID 호환은 기술 용어보다 마케팅 용어에 가깝다.",
+        },
+        {
+          type: "mcq",
+          q: "Multi-object transaction이 필요한 이유가 아닌 것은?",
+          options: [
+            "foreign key 참조의 유효성 유지",
+            "denormalize된 데이터의 동시 갱신",
+            "secondary index와 원본 데이터의 동기화",
+            "단일 counter의 원자적 증가",
+          ],
+          answer: 3,
+          expl: "단일 counter 증가는 single-object atomic operation으로 충분하다. foreign key, denormalization, secondary index가 multi-object transaction의 대표 사유.",
+        },
+        {
+          type: "mcq",
+          q: "실패한 트랜잭션 재시도의 함정으로 옳은 것은?",
+          options: [
+            "재시도는 어떤 경우에도 안전하다",
+            "commit은 성공했는데 확인 응답만 유실됐다면 재시도로 트랜잭션이 두 번 실행될 수 있다",
+            "제약 조건 위반 같은 영구적 오류도 재시도하면 해결된다",
+            "과부하 상황에서는 즉시 무한 재시도하는 것이 최선이다",
+          ],
+          answer: 1,
+          expl: "commit 성공 + 응답 유실 시 재시도는 이중 실행(exactly-once 문제). 영구적 오류는 재시도 무의미, 과부하 시엔 backoff가 필요하다.",
+        },
+        {
+          type: "mcq",
+          q: "Read committed 격리 수준에서 dirty read를 막는 실무적 구현은?",
+          options: [
+            "모든 읽기에 shared lock을 건다",
+            "쓰는 중인 객체의 이전 committed 값을 기억해 두었다가 읽기에는 그 값을 돌려준다",
+            "읽기를 모두 단일 스레드로 직렬화한다",
+            "읽기 전에 항상 fsync한다",
+          ],
+          answer: 1,
+          expl: "read lock 방식은 긴 쓰기가 모든 읽기를 막으므로, 실무는 옛 committed 값을 기억해 돌려준다. 읽기는 lock을 잡지 않는다.",
+        },
+        {
+          type: "mcq",
+          q: "Alice의 은행 잔고 예시(계좌 합이 $900으로 보임)가 보여주는 anomaly는?",
+          options: [
+            "dirty write",
+            "lost update",
+            "read skew (nonrepeatable read)",
+            "deadlock",
+          ],
+          answer: 2,
+          expl: "각 읽기는 committed 데이터였지만 서로 다른 시점의 상태가 섞였다 — read skew. snapshot isolation이 해법이며, backup·분석 쿼리에서 특히 치명적이다.",
+        },
+        {
+          type: "mcq",
+          q: "MVCC의 가시성 규칙상, 어떤 트랜잭션에게 보이지 않는 것은?",
+          options: [
+            "자기 시작 전에 commit된 트랜잭션이 만든 버전",
+            "자기보다 나중에 시작한 트랜잭션이 commit한 쓰기",
+            "나중 트랜잭션이 삭제 표시했지만 자기 시작 시점엔 존재하던 row",
+            "자기 자신이 쓴 데이터",
+          ],
+          answer: 1,
+          expl: "나보다 나중에 시작한 트랜잭션의 쓰기는 commit 여부와 무관하게 안 보인다. 세 번째는 반대로 보인다 — 삭제가 나중이므로 내 스냅샷에는 여전히 존재.",
+        },
+        {
+          type: "mcq",
+          q: "Isolation level 이름에 관한 실제 혼란으로 옳은 것은?",
+          options: [
+            'Oracle은 snapshot isolation을 "serializable"이라 부른다',
+            'PostgreSQL은 snapshot isolation을 "read uncommitted"라 부른다',
+            "MySQL은 snapshot isolation을 지원하지 않는다",
+            "SQL 표준에 snapshot isolation이 명확히 정의되어 있다",
+          ],
+          answer: 0,
+          expl: "SQL 표준에 snapshot isolation이 없어서 Oracle은 이를 serializable이라 부르고(실제론 아님), PostgreSQL·MySQL은 repeatable read라 부른다.",
+        },
+        {
+          type: "mcq",
+          q: "Lost update를 막는 가장 좋은 방법(가능하다면)은?",
+          options: [
+            "UPDATE counters SET value = value + 1 같은 DB의 atomic write operation 사용",
+            "애플리케이션에서 읽고 수정해 다시 쓰기",
+            "격리 수준을 read uncommitted로 낮추기",
+            "트랜잭션을 더 길게 유지하기",
+          ],
+          answer: 0,
+          expl: "atomic write operation은 read-modify-write cycle 자체를 제거하므로 가능하면 최선. ORM이 무심코 read-modify-write 패턴을 만들기 쉬운 게 함정.",
+        },
+        {
+          type: "mcq",
+          q: "Lost update의 자동 감지(automatic detection)에 대한 설명으로 옳은 것은?",
+          options: [
+            "모든 DB의 repeatable read가 지원한다",
+            "PostgreSQL 등은 snapshot isolation과 결합해 감지 시 abort시키지만, MySQL InnoDB의 repeatable read는 감지하지 않는다",
+            "lock을 먼저 잡아 예방하는 비관적 기법이다",
+            "복제 환경의 LWW와 같은 원리다",
+          ],
+          answer: 1,
+          expl: "PostgreSQL repeatable read, Oracle, SQL Server(snapshot)는 감지해 abort시킨다. MySQL InnoDB repeatable read는 감지하지 않는다. lock 없이 사후 감지하므로 낙관적이다.",
+        },
+        {
+          type: "mcq",
+          q: "당직 의사 예시(둘 다 off-call 신청 → on-call 0명)가 lost update가 아닌 이유는?",
+          options: [
+            "두 트랜잭션이 같은 객체를 덮어썼기 때문",
+            "두 트랜잭션이 같은 데이터를 읽었지만 서로 다른 객체(각자 자신의 레코드)를 갱신했기 때문",
+            "트랜잭션이 abort되었기 때문",
+            "dirty read가 발생했기 때문",
+          ],
+          answer: 1,
+          expl: '같은 데이터를 읽고 서로 다른 객체를 갱신해 공동의 전제("최소 1명 on-call")를 무너뜨렸다 — write skew, lost update의 일반화.',
+        },
+        {
+          type: "mcq",
+          q: "Actual serial execution이 현실적으로 가능해진 배경이 아닌 것은?",
+          options: [
+            "RAM이 싸져 전체 active dataset을 메모리에 올릴 수 있게 됨",
+            "OLTP 트랜잭션이 짧고 작다는 인식",
+            "stored procedure로 트랜잭션 전체를 한 번에 제출 가능",
+            "디스크가 메모리보다 빨라짐",
+          ],
+          answer: 3,
+          expl: "배경은 값싼 RAM(in-memory)과 짧은 OLTP 트랜잭션, 그리고 stored procedure. 디스크가 빨라진 것과는 무관하다.",
+        },
+        {
+          type: "mcq",
+          q: "2PL과 snapshot isolation(MVCC)의 결정적 차이는?",
+          options: [
+            "2PL은 쓰기에 lock을 쓰지 않는다",
+            "2PL에서는 readers block writers, writers block readers — MVCC는 둘 다 아님",
+            "MVCC는 dirty write를 허용한다",
+            "2PL은 낙관적, MVCC는 비관적이다",
+          ],
+          answer: 1,
+          expl: "2PL은 shared/exclusive lock을 트랜잭션 끝까지 보유해 읽기와 쓰기가 서로를 블로킹한다. MVCC의 mantra(readers never block writers, writers never block readers)와 정반대.",
+        },
+        {
+          type: "mcq",
+          q: "SSI(Serializable Snapshot Isolation)의 동작 방식은?",
+          options: [
+            "모든 읽기에 predicate lock을 걸어 사전에 차단한다",
+            "트랜잭션을 단일 스레드에서 순차 실행한다",
+            "일단 실행시키고 commit 시점에 읽었던 전제(premise)가 stale해졌는지 감지해 abort한다",
+            "충돌 row를 미리 materialize해 둔다",
+          ],
+          answer: 2,
+          expl: "SSI는 낙관적: snapshot isolation 위에서 실행하고, stale MVCC 읽기와 과거 읽기에 영향을 주는 쓰기를 추적해 commit 시 위반 트랜잭션을 abort한다.",
+        },
+        {
+          type: "ox",
+          q: "Read committed 격리 수준은 dirty write를 row-level write lock으로 막는다.",
+          answer: true,
+          expl: "쓰려면 row-level write lock을 획득하고 commit/abort까지 보유한다. dirty read 쪽만 lock 대신 옛 값 반환으로 처리한다.",
+        },
+        {
+          type: "ox",
+          q: "SSI는 lock으로 충돌을 사전에 차단하는 비관적(pessimistic) 동시성 제어 기법이다.",
+          answer: false,
+          expl: "SSI는 낙관적이다. 블로킹 없이 실행하고 commit 시점에 검사해 abort한다. 비관적 기법은 2PL과 actual serial execution.",
+        },
+        {
+          type: "ox",
+          q: "완벽한 durability는 존재하지 않으며, 디스크 쓰기·복제·백업 등 여러 기법을 겹쳐 위험을 줄일 뿐이다.",
+          answer: true,
+          expl: "디스크·펌웨어 버그, 백업 손상, 전 replica 동시 장애 등을 고려하면 절대적 보장은 없다. 여러 기법을 겹쳐 위험을 낮출 뿐.",
+        },
+        {
+          type: "short",
+          q: "회의실 예약처럼 잠글 row가 존재하지 않는 phantom 문제에서, 충돌을 표현하는 row(예: 회의실×시간 슬롯)를 미리 만들어 lock 대상으로 삼는 최후의 수단 기법의 이름은?",
+          answers: ["materializing conflicts", "충돌 구체화"],
+          expl: "Materializing conflicts — 잠글 row가 없을 때 충돌을 표현하는 row를 미리 생성해 lock 대상으로 만든다. 동시성 제어가 데이터 모델로 새어 나오므로 최후의 수단.",
+        },
+        {
+          type: "short",
+          q: '2PL에서 phantom을 막기 위해 "검색 조건 자체"에 거는 lock의 이름은? (대부분의 DB가 실제로 쓰는, 인덱스 범위로 근사한 변형이 아닌 원형)',
+          answers: ["predicate lock", "프레디킷 락"],
+          expl: "Predicate lock — 검색 조건에 걸리는(아직 존재하지 않는 객체 포함) 모든 객체에 적용되는 lock. 성능 때문에 대부분의 DB는 index-range lock(next-key lock)으로 근사한다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>
