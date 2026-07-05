@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch8. The Trouble with Distributed Systems — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+        <a href="ch07.html">Ch7</a>
+        <a href="ch08.html" class="active">Ch8</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch8. The Trouble with Distributed Systems</h1>
+      <p class="subtitle">
+        잘못될 수 있는 것은 반드시 잘못된다 — 신뢰할 수 없는 네트워크·시계·
+        프로세스 위에서 <strong>partial failure</strong>와 함께 사는 법, 그리고
+        quorum·fencing token·system model로 "진실"을 정의하는 법
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        단일 머신의 소프트웨어는 결정적(deterministic)이다 — 하드웨어가 멀쩡하면
+        같은 연산은 항상 같은 결과를 내고, 고장 나면 시스템 전체가 죽는다(전부
+        아니면 전무). 분산 시스템의 정의적 특징은
+        <strong>partial failure(부분 실패)</strong> — 일부는 망가졌는데 나머지는
+        멀쩡히 동작하는 상태 — 이며, 게다가 부분 실패는
+        <strong>비결정적(nondeterministic)</strong>이다. 뭔가가 성공했는지조차
+        알 수 없을 때가 있다.
+      </p>
+      <p>
+        믿을 수 없는 것은 세 가지다: <strong>네트워크</strong>(패킷은
+        유실·지연되고 응답이 없으면 원인을 알 수 없다),
+        <strong>시계</strong>(노드마다 다르게 흐르고 툭하면 튄다),
+        <strong>프로세스 자체</strong>(GC 등으로 언제든 멈춘다). 결론은
+        역설적이다 —
+        <strong>신뢰할 수 없는 부품들로 신뢰할 수 있는 시스템을 짓는 것</strong
+        >이 분산 시스템 엔지니어링의 본질이다.
+      </p>
+      <blockquote>
+        <strong>Supercomputer(HPC) vs Cloud</strong> — HPC는 한 노드가 죽으면
+        전체 작업을 멈추고 checkpoint에서 재시작한다: 부분 실패를 전체 실패로
+        <strong>승격</strong>시켜 단일 머신처럼 다룬다. cloud computing은
+        상용(commodity) 하드웨어 위에서 온라인 서비스를 멈출 수 없으므로,
+        <strong>fault를 전제하고 소프트웨어로 fault tolerance를 구축</strong
+        >한다 — "고장은 언제나 어딘가에서 일어나고 있다". TCP가 신뢰성 낮은 IP
+        위에 쌓이듯, 신뢰성 낮은 층 위에 더 신뢰성 높은 층을 쌓는다.
+      </blockquote>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>Unreliable Networks — 신뢰할 수 없는 네트워크</h3>
+      <p>
+        인터넷과 데이터센터 네트워크는
+        <strong>asynchronous packet network</strong>다 — 패킷 전달 시간에 아무
+        보장이 없다. 요청을 보내고 응답을 기다릴 때 잘못될 수 있는 경우:
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>무엇이 잘못되나</th>
+            <th>예</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td>요청이 <strong>유실</strong>됨</td>
+            <td>케이블 뽑힘</td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td>요청이 <strong>queue에서 대기</strong> 중</td>
+            <td>수신자 과부하 — 나중에 전달됨</td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td>원격 노드가 <strong>crash</strong>했음</td>
+            <td>전원 차단</td>
+          </tr>
+          <tr>
+            <td>4</td>
+            <td>원격 노드가 <strong>일시 정지</strong> 후 재개</td>
+            <td>GC pause — 죽은 게 아니다</td>
+          </tr>
+          <tr>
+            <td>5</td>
+            <td>처리됐는데 <strong>응답이 유실</strong>됨</td>
+            <td>스위치 설정 오류</td>
+          </tr>
+          <tr>
+            <td>6</td>
+            <td>응답이 <strong>지연</strong>됨</td>
+            <td>네트워크·수신자 과부하</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        핵심: 응답을 받지 못하면 <strong>이 경우들을 구별할 수 없다</strong> —
+        요청이 갔는지, 처리됐는지조차 모른다. 유일한 정보는 "아직 응답이
+        없다"뿐이고, 실무적 대응은 <strong>timeout</strong>이다. 하지만
+        timeout이 나도 상대가 요청을 처리했는지는 여전히 모른다 — 그저 포기하는
+        것이다.
+      </p>
+      <ul>
+        <li>
+          <strong>Network faults in practice</strong>: 한 중견 데이터센터
+          연구에서 월 ~12건의 네트워크 장애; EC2는 transient glitch로 유명;
+          상어가 해저 케이블을 물어뜯고; 스위치 설정 오류로
+          <strong>한 방향으로만</strong> 패킷이 흐르기도 한다. 네트워크 일부가
+          단절되는 것이 <strong>network partition(netsplit)</strong>. 장애는
+          없앨 수 없으므로 소프트웨어의 대응을 Chaos Monkey류로
+          <strong>테스트</strong>해야 한다.
+        </li>
+        <li>
+          <strong>Detecting faults</strong>: 일부 피드백은 있다 — 프로세스가
+          죽고 OS는 살아 있으면 <strong>RST/FIN</strong>으로 연결 거부; crash를
+          스크립트가 다른 노드에 통지(HBase); 스위치 관리 인터페이스의 링크 다운
+          감지; ICMP Destination Unreachable. 그러나 모두 있을 수도 없을 수도
+          있는 부가 정보 — 처리 확신은 애플리케이션의 긍정 응답뿐이고, 결국
+          <strong>timeout에 의존</strong>한다.
+        </li>
+        <li>
+          <strong>Sync vs async network</strong>: 전화망(circuit-switched)은
+          경로 전체에 대역폭을 <strong>예약</strong>해 큐잉이 없고
+          <strong>bounded delay</strong>를 보장한다. TCP/이더넷은
+          packet-switched — 데이터가 <strong>bursty</strong>하므로 동적으로
+          대역폭을 나눠 링크 활용률을 극대화한다. 결국
+          <strong>latency 보장 vs 자원 활용률(비용)의 trade-off</strong>이며,
+          현재 기술로는 큐잉 지연의 상한을 보장할 수 없다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — timeout 딜레마와 queueing delay의 원인들:
+        timeout이 <em>너무 길면</em> 죽은 노드 선언까지 사용자가 에러를 계속
+        보고, <em>너무 짧으면</em> 살아 있는(느린) 노드를 성급하게 사망 선고한다
+        — 그 노드가 하던 작업(이메일 발송 등)을 다른 노드가 또 하면
+        <strong>중복 수행</strong>이 되고, 느림의 원인이 과부하였다면 부하
+        이전이 연쇄 과부하를 낳아 <strong>cascading failure</strong>(모든 노드가
+        서로를 죽었다고 선언)로 번진다. 이상적 공식 timeout = 2d + r은 현실에서
+        무너진다 — 지연 d도 처리 시간 r도 <strong>unbounded</strong>이기 때문.
+        변동의 주범은 여러 층의 <strong>queueing</strong>이다: ① 스위치
+        큐(여럿이 같은 목적지로 동시 전송 — 가득 차면 drop, 혼잡), ② 목적지 OS
+        큐(CPU가 바쁠 때), ③ VM 스케줄링 대기(VM monitor가 큐잉), ④ TCP flow
+        control(송신자 스스로 자제), ⑤ TCP 재전송(유실 패킷의 timeout 대기가
+        애플리케이션에는 지연으로 보임). 멀티테넌트 클라우드에서는 noisy
+        neighbor 때문에 특히 심하다. 그래서 timeout은 상수가 아니라 지연 분포를
+        관측해 실험적으로 정하거나,
+        <strong>Phi Accrual failure detector</strong>(Akka, Cassandra)처럼 응답
+        시간 분포를 계속 측정해 자동 조정한다.
+      </div>
+
+      <h3>Unreliable Clocks — 신뢰할 수 없는 시계</h3>
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Time-of-day clock (벽시계)</th>
+            <th>Monotonic clock</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>반환값</strong></td>
+            <td>
+              현재 날짜·시간 (<code>CLOCK_REALTIME</code>,
+              <code>System.currentTimeMillis()</code>)
+            </td>
+            <td>
+              절대값은 무의미 — 두 시점의 차이만 유효
+              (<code>CLOCK_MONOTONIC</code>, <code>System.nanoTime()</code>)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>NTP와의 관계</strong></td>
+            <td>동기화 대상 — <strong>뒤로 점프할 수 있다</strong></td>
+            <td>진행 속도만 미세 조정(slew) — 점프 없음, 항상 전진</td>
+          </tr>
+          <tr>
+            <td><strong>용도</strong></td>
+            <td>날짜·시간 표기 (duration 측정 부적합)</td>
+            <td><strong>duration·timeout 측정</strong>에 사용해야 한다</td>
+          </tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>
+          <strong>동기화의 현실</strong>: 수정 발진기 drift(Google 가정 200ppm —
+          하루 17초); NTP 정확도는 네트워크 지연에 제한(공용 인터넷 35ms+); 너무
+          벌어지면 <strong>강제 리셋</strong>(점프); 잘못된 NTP 서버·방화벽;
+          <strong>leap second</strong>(59초/61초짜리 1분 — 실제 장애 다수,
+          smearing으로 완화); VM의 가상화된 시계; 사용자 기기의 시계는 아예 신뢰
+          불가.
+        </li>
+        <li>
+          <strong>시계 문제는 조용하다</strong>: 시계가 서서히 어긋나도
+          소프트웨어는 잘 도는 것처럼 보이고, 데이터가
+          <strong>소리 없이 유실</strong>된다 — 극적인 crash보다 위험하다.
+        </li>
+        <li>
+          <strong>Confidence interval과 Spanner TrueTime</strong>: 시계 읽기는
+          하나의 시점이 아니라 불확실성 <strong>구간</strong>으로 봐야 한다.
+          Google Spanner의 TrueTime API는 [earliest, latest]를 반환하고,
+          snapshot isolation의 트랜잭션 순서를 위해 commit 전에
+          <strong>구간 길이만큼 의도적으로 기다린다</strong>(waiting out the
+          uncertainty). 대기를 짧게 하려고 데이터센터마다 GPS 수신기·원자시계를
+          두어 불확실성을 ~7ms로 유지한다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — monotonic vs time-of-day clock과 LWW의
+        위험: timeout을 벽시계로 재면 NTP가 시계를 뒤로 돌리는 순간 "음수 경과
+        시간" 같은 괴현상이 생긴다 — 그래서 duration은 반드시 monotonic
+        clock으로 잰다. 더 위험한 것은 <em>노드 간 순서</em>를 물리 시계에
+        맡기는 것이다. Cassandra류의 <strong>LWW(last write wins)</strong>는
+        timestamp가 가장 큰 쓰기를 승자로 삼는데, 노드 간 시계 skew가 있으면 —
+        시계가 느린 노드에서 <em>인과적으로 나중에</em> 일어난 쓰기가, 시계 빠른
+        노드의 이전 쓰기에게
+        <strong>에러 하나 없이 조용히 패배해 버려진다</strong>. causality 위반 +
+        silent data loss. 시계를 아무리 잘 동기화해도(수십 ms 오차) 그보다 빠른
+        연속 쓰기의 순서는 뒤집힐 수 있다. 교훈: 사건의 순서에는 물리 시계가
+        아니라 <strong>logical clock</strong>(단조 증가 카운터 — 상대적 순서만
+        기록)을 써야 하고, 물리 시계를 꼭 써야 한다면 Spanner처럼 읽기를
+        confidence interval로 취급하고 불확실성을 기다려 없애야 한다.
+      </div>
+
+      <h3>Process Pauses — 프로세스는 언제든 멈춘다</h3>
+      <p>
+        lease 기반 leader 판정 코드를 생각하라 — "만료까지 10초 남았으니
+        안전"이라 판단하고 쓰기를 수행하는 순간 스레드가
+        <strong>15초 멈췄다면</strong>? 재개된 코드는 자신이 멈췄다는 사실조차
+        모른 채 이미 만료된 lease로 쓰기를 계속한다. 멈춤의 원인:
+      </p>
+      <ul>
+        <li><strong>GC</strong>: "stop-the-world" — 때로 분 단위 정지.</li>
+        <li>
+          <strong>VM suspend/resume</strong>(live migration 포함), 노트북 뚜껑
+          닫기 등 기기 suspend.
+        </li>
+        <li>
+          OS context switch, hypervisor의 <strong>CPU steal</strong>(다른 VM에게
+          CPU를 뺏김).
+        </li>
+        <li>
+          예기치 못한 디스크 I/O(Java classloader의 lazy loading 등),
+          <strong>swap/thrashing</strong>(서버에서 swap을 끄는 이유),
+          <strong>SIGSTOP</strong>(Ctrl-Z — SIGCONT까지 프로세스는 아무것도 모른
+          채 정지).
+        </li>
+      </ul>
+      <p>
+        단일 머신에는 mutex·semaphore가 있지만 분산에는
+        <strong>공유 메모리가 없다</strong> — 노드는 통째로 멈출 수 있고
+        나머지는 계속 달린다. 응답 deadline이 보장되는
+        <strong>hard real-time 시스템(RTOS)</strong>이 항공기·자동차 제어에는
+        존재하지만, 언어·라이브러리 전면 제약과 막대한 비용, 낮은 처리량 때문에
+        서버 데이터 시스템에는 비경제적이다. 현실적 완화책: ① GC pause를
+        <strong>계획된 순단</strong>처럼 취급(런타임이 GC 임박을 경고하면 요청을
+        다른 노드로 우회), ② 단명 객체만 빠른 GC로 처리하고 full GC 전에
+        <strong>프로세스를 주기적으로 재시작</strong>(rolling restart).
+      </p>
+
+      <h3>Knowledge, Truth, and Lies — 진실은 다수결로 정의된다</h3>
+      <ul>
+        <li>
+          <strong>노드는 자기 판단을 믿을 수 없다</strong>: 요청은 다 처리하는데
+          응답만 안 나가는 <strong>반쪽 단절 노드</strong>는 자신이 멀쩡하다고
+          확신하지만 남들은 사망 선고를 내린다; 1분 GC로 멈춘 노드는 깨어나서도
+          1분이 지난 줄 모른다. 그래서 분산 알고리즘은
+          <strong>quorum(과반수) 투표</strong>에 의존한다 — 과반이 죽었다고
+          선언하면 (본인이 살아 있다고 느껴도) 죽은 것으로 간주된다. 과반을
+          요구하는 이유는 상충하는 두 결정이 동시에 성립할 수 없게 하기 위함.
+        </li>
+        <li>
+          <strong>Byzantine faults</strong>: 노드가 "거짓말"(임의의 오작동,
+          조작된 응답)을 할 수 있는 fault. 견디는 시스템이
+          <strong>Byzantine fault-tolerant</strong>(비잔틴 장군 문제에서 유래).
+          필요한 곳 — <strong>항공우주</strong>(방사선에 의한 메모리 오염),
+          <strong>블록체인</strong>(중앙 권위 없는 상호 불신 참여자). 대부분의
+          데이터 시스템은 전 노드를 한 조직이 통제하므로
+          <strong>non-Byzantine을 가정</strong>한다 (BFT 프로토콜은 비싸고
+          복잡하다; 클라이언트의 악의는 서버의 입력 검증으로 처리). 다만
+          <strong>약한 거짓말 방어</strong>는 가치가 있다: 패킷 오염 대비
+          checksum(TCP checksum이 못 잡는 것도 있다), 입력 sanity
+          check/validation, <strong>여러 NTP 서버</strong> 참조로 outlier 제거.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — fencing token이 필요한 이유: lock/lease를
+        가진 클라이언트가 "오직 나만 쓸 수 있다"고 믿는 것 자체가 함정이다. GC
+        pause 중 lease가 만료되고 다른 노드가 lock을 받았는데, 깨어난 옛
+        보유자는 <em>자신이 멈췄다는 사실을 모른 채</em> 쓰기를 계속한다 —
+        HBase에서 실제로 데이터가 깨진 버그다. lock만으로 못 막는 이유는 검사
+        시점("나 아직 유효하지?")과 쓰기 시점 사이에 얼마든지 pause가 끼어들 수
+        있기 때문. 해법은 신뢰의 방향을 뒤집는 것이다 — lock 서버가 lock을 줄
+        때마다 <strong>단조 증가하는 fencing token</strong>을 발급하고,
+        <strong>storage 쪽이</strong> 쓰기마다 토큰을 검사해 이미 더 높은 토큰을
+        처리했다면 낮은 토큰의 쓰기를 거부한다(ZooKeeper라면 zxid/cversion을
+        토큰으로 쓸 수 있다). 낡은 lease로 깨어난 클라이언트의 쓰기는 오래된
+        토큰이라 자동 차단된다. 교훈: 클라이언트가 스스로 착하게 굴기를 기대하는
+        시스템은 안전하지 않다 — <strong>검사는 서버 측에서</strong> 해야 한다.
+        (단, fencing token도 "몰라서" 틀리는 노드까지만 막는다 — 토큰을 위조하는
+        <em>거짓말쟁이</em>는 Byzantine fault의 영역이다.)
+      </div>
+
+      <h3>System Models — 가정을 형식화하기</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>축</th>
+            <th>모델</th>
+            <th>가정</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td rowspan="3"><strong>Timing</strong></td>
+            <td><strong>Synchronous</strong></td>
+            <td>
+              네트워크 지연·pause·시계 오차 모두 bounded — 현실 데이터
+              시스템에는 비현실적
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Partially synchronous</strong></td>
+            <td>
+              대부분의 시간엔 synchronous, 가끔 한도 초과 —
+              <strong>가장 현실적</strong>
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Asynchronous</strong></td>
+            <td>타이밍 가정 전무(시계조차 없음) — 매우 제한적</td>
+          </tr>
+          <tr>
+            <td rowspan="3"><strong>Node failure</strong></td>
+            <td><strong>Crash-stop</strong></td>
+            <td>crash로만 실패, 죽으면 영영 안 돌아옴</td>
+          </tr>
+          <tr>
+            <td><strong>Crash-recovery</strong></td>
+            <td>
+              crash 후 재시작 가능 — 안정 저장소는 보존, 메모리는 유실.
+              <strong>가장 유용한 현실적 모델</strong>
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Byzantine (arbitrary)</strong></td>
+            <td>무엇이든 할 수 있음 — 속임수 포함</td>
+          </tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>
+          실무 표준 조합:
+          <strong>partially synchronous + crash-recovery</strong>.
+        </li>
+        <li>
+          <strong>Safety</strong>: "나쁜 일이 일어나지 않는다" — 위반 시점을
+          특정할 수 있고 <strong>되돌릴 수 없다</strong>(예: fencing token의
+          uniqueness·단조 증가). crash·네트워크 유실을 포함한
+          <strong>모든 상황에서 항상</strong> 성립해야 한다.
+        </li>
+        <li>
+          <strong>Liveness</strong>: "좋은 일이 결국(eventually) 일어난다" (예:
+          요청은 결국 응답을 받는다). 조건부 보장이 허용된다(과반 노드 생존 +
+          네트워크가 결국 회복하면).
+        </li>
+        <li>
+          <strong>이론 vs 실전</strong>: system model은 추상화다 — 현실에선
+          "안정 저장소"조차 깨질 수 있다(디스크 펌웨어 버그). 그래도 추상
+          모델에서의 정확성 증명은 무의미하지 않다 — 오히려 그 덕에 알고리즘을
+          여러 구현에서 신뢰할 수 있다. 증명과 현실 테스트가
+          <strong>둘 다</strong> 필요하다.
+        </li>
+      </ul>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Partial failure — 오케스트라의 한 명</h3>
+        <p>
+          독주자(단일 머신)는 틀리면 연주 전체를 멈추고 다시 시작하면 된다. 백
+          명의 오케스트라(분산 시스템)는 한 명이 악보를 놓쳐도 나머지는 연주를
+          계속한다 — 문제는 "누가 틀렸는지, 틀리긴 했는지"를 연주 중에 알기
+          어렵다는 것.
+        </p>
+      </div>
+      <div class="card">
+        <h3>응답 없는 요청 — 답장 없는 편지</h3>
+        <p>
+          편지를 보냈는데 답이 없다. 편지가 유실됐나, 받고 무시했나, 답장이
+          유실됐나, 상대가 이사 갔나 —
+          <strong>답장이 오기 전까지는 구별할 방법이 없다</strong>. 기다리다
+          포기(timeout)할 수는 있지만, 상대가 읽었는지는 여전히 모른다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Timeout 딜레마 — 회의에 늦는 동료</h3>
+        <p>
+          10분을 기다려도 안 오면 "결석" 처리하고 회의를 시작했는데 11분에
+          도착하면? 그 사람 몫의 일을 이미 남에게 배정했다면
+          <strong>같은 일을 두 명이</strong> 하게 된다. 그렇다고 1시간을
+          기다리면 모두의 시간 낭비다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Queueing — 출근길 정체</h3>
+        <p>
+          도로(네트워크) 자체는 그대로인데 차가 몰리면(bursty traffic)
+          램프·교차로마다 줄이 생겨 소요 시간이 들쭉날쭉해진다. 전용 차선
+          예약(circuit switching)은 정시성을 주지만 빈 시간엔 아무도 못 쓴다 —
+          <strong>정시성 vs 도로 활용률</strong>의 trade-off.
+        </p>
+      </div>
+      <div class="card">
+        <h3>두 시계 — 벽시계와 스톱워치</h3>
+        <p>
+          라면 끓이는 시간은 스톱워치(monotonic)로 재야 한다.
+          벽시계(time-of-day)는 재는 도중 누가 시간을 맞춰버리면(NTP 점프)
+          "라면이 -30초 만에 익었다"는 결과가 나올 수 있다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>LWW — 심판마다 다른 초시계</h3>
+        <p>
+          각 지역 심판이 자기 손목시계로 기록을 찍는 대회. 시계가 느린 심판의
+          선수는 실제로 나중에 완주했어도 기록상으로는 먼저 들어온 선수를
+          이겨버린다 — 아무도 눈치채지 못한 채(silent data loss).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Process pause — 발표 중 졸도</h3>
+        <p>
+          발표자가 "이제 결론을…" 하다가 1분간 의식을 잃었다 깨어나면 본인은
+          문장을 잇지만, 청중은 이미 다른 발표자를 무대에 올렸다. 본인만 1분이
+          지난 것을 모른다 — GC pause 후의 leader가 정확히 이 상태다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Quorum — 항해 중의 다수결</h3>
+        <p>
+          선장이 "나는 멀쩡하다"고 우겨도, 선원 과반이 "선장이 쓰러졌었다"고
+          판정하면 새 선장을 뽑는다. 개인의 자기 인식보다
+          <strong>다수의 합의</strong>가 공식 기록이 된다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Fencing token — 은행 창구의 번호표</h3>
+        <p>
+          창구(storage)는 지금까지 처리한 번호보다
+          <strong>작은 번호표</strong>를 들고 오는 손님을 거절한다. 화장실
+          다녀오느라(GC pause) 옛 번호표를 들고 온 손님은 자신이 유효하다고
+          믿어도 창구에서 걸러진다 — 손님의 양심이 아니라
+          <strong>창구의 검사</strong>가 안전을 만든다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Byzantine fault — 거짓말하는 장군</h3>
+        <p>
+          포위 공격의 성패는 장군들의 동시 공격에 달렸는데, 일부 장군이 배신해
+          서로 다른 전갈을 보낸다. 연락 두절 장군(crash)보다 거짓말하는 장군이
+          훨씬 어렵다. 데이터센터는 같은 편 장군만 있다고
+          가정하고(non-Byzantine), 블록체인은 배신자를 전제한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Safety vs liveness — 신호등의 두 약속</h3>
+        <p>
+          "교차 방향이 동시에 초록이 되지 않는다"는 safety(한 번이라도 깨지면
+          사고, 되돌릴 수 없음), "빨간불은 언젠가 초록이 된다"는 liveness(당장은
+          아니어도 결국). 안전은 항상, 진행은 조건부로.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Partial failure</strong></td>
+            <td>
+              시스템 일부만 망가지고 나머지는 동작 — 분산 시스템의 정의적 특징,
+              비결정적
+            </td>
+          </tr>
+          <tr>
+            <td><strong>HPC vs Cloud 접근</strong></td>
+            <td>
+              부분 실패를 전체 실패로 승격(checkpoint 재시작) vs fault를 전제로
+              소프트웨어에서 fault tolerance 구축
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Asynchronous packet network</strong></td>
+            <td>패킷 전달 시간에 아무 보장이 없는 네트워크 (인터넷, 이더넷)</td>
+          </tr>
+          <tr>
+            <td><strong>Network partition (netsplit)</strong></td>
+            <td>네트워크 일부가 다른 부분과 단절되는 장애</td>
+          </tr>
+          <tr>
+            <td><strong>Timeout</strong></td>
+            <td>
+              일정 시간 응답 없으면 실패 간주 — 원인은 구별 못 하고 그저 포기
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Unbounded delay</strong></td>
+            <td>네트워크 지연·처리 시간에 상한 없음 — timeout 공식 무력화</td>
+          </tr>
+          <tr>
+            <td><strong>Cascading failure</strong></td>
+            <td>성급한 사망 선고 → 부하 이전 → 연쇄 과부하</td>
+          </tr>
+          <tr>
+            <td><strong>Queueing delay</strong></td>
+            <td>
+              스위치 큐, OS 큐, VM 스케줄링, TCP flow control·재전송 — 지연
+              변동의 주범
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Phi Accrual failure detector</strong></td>
+            <td>응답 시간 분포로 timeout을 자동 조정 (Akka, Cassandra)</td>
+          </tr>
+          <tr>
+            <td><strong>Circuit-switched / Packet-switched</strong></td>
+            <td>
+              대역폭 예약으로 bounded delay vs bursty traffic에 최적화된 큐잉
+              (활용률 극대화)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Time-of-day clock</strong></td>
+            <td>
+              현재 날짜·시간 반환, NTP로 뒤로 점프 가능 — duration 측정 부적합
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Monotonic clock</strong></td>
+            <td>항상 전진, duration 측정 전용 — timeout 측정에 사용</td>
+          </tr>
+          <tr>
+            <td><strong>Clock drift</strong></td>
+            <td>수정 발진기가 빠르거나 느리게 가는 현상</td>
+          </tr>
+          <tr>
+            <td><strong>Leap second</strong></td>
+            <td>59초/61초짜리 1분 — 실제 장애 원인, smearing으로 완화</td>
+          </tr>
+          <tr>
+            <td><strong>LWW (last write wins)</strong></td>
+            <td>
+              timestamp 최대 쓰기가 승리 — 시계 skew 시 조용한 데이터
+              유실·causality 위반
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Logical clock</strong></td>
+            <td>물리 시간 대신 단조 증가 카운터로 상대적 순서를 매김</td>
+          </tr>
+          <tr>
+            <td><strong>Confidence interval / TrueTime</strong></td>
+            <td>
+              시계 읽기를 [earliest, latest] 구간으로 취급 — Spanner는 commit 전
+              구간만큼 대기
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Process pause</strong></td>
+            <td>
+              GC, VM suspend, CPU steal, swap, SIGSTOP 등으로 임의 시간 정지
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Lease</strong></td>
+            <td>시한부 lock — pause 중 만료를 본인만 모를 수 있음</td>
+          </tr>
+          <tr>
+            <td><strong>Hard real-time system</strong></td>
+            <td>
+              deadline 보장 시스템(RTOS) — 서버 데이터 시스템에는 비경제적
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Quorum</strong></td>
+            <td>
+              과반수 투표로 결정 — 개별 노드의 자기 판단보다 우선하는 "진실"
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Fencing token</strong></td>
+            <td>
+              lock 발급마다 단조 증가하는 토큰 — storage가 검사해 낡은 보유자의
+              쓰기 차단
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Byzantine fault</strong></td>
+            <td>노드가 임의로 오작동하거나 거짓말을 함 (비잔틴 장군 문제)</td>
+          </tr>
+          <tr>
+            <td><strong>Byzantine fault tolerance</strong></td>
+            <td>
+              일부 노드의 배신에도 올바르게 동작 — 항공우주·블록체인용, 대부분의
+              데이터 시스템은 non-Byzantine 가정
+            </td>
+          </tr>
+          <tr>
+            <td>
+              <strong
+                >Synchronous / Partially synchronous / Asynchronous</strong
+              >
+            </td>
+            <td>지연·pause·시계 오차의 bounded 여부에 대한 타이밍 모델</td>
+          </tr>
+          <tr>
+            <td><strong>Crash-stop / Crash-recovery / Byzantine</strong></td>
+            <td>
+              노드 실패 모델 — 실무 표준은 partially synchronous +
+              crash-recovery
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Safety</strong></td>
+            <td>
+              "나쁜 일이 일어나지 않는다" — 위반은 되돌릴 수 없고, 항상 성립해야
+              함
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Liveness</strong></td>
+            <td>"좋은 일이 결국 일어난다" — eventually, 조건부 보장 허용</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        분산 시스템에서는 네트워크(unbounded delay), 시계(drift·점프),
+        프로세스(pause)를 모두 믿을 수 없고, 응답이 없으면
+        <strong>원인조차 구별할 수 없다</strong> — 그래서 진실은 개별 노드가
+        아니라 <strong>quorum이 정의</strong>하고, 안전은 클라이언트의 양심이
+        아니라 <strong>fencing token 검사</strong>가 만들며, 알고리즘은 system
+        model(partially synchronous + crash-recovery)의 가정 위에서 safety는
+        항상, liveness는 조건부로 보장하도록 설계한다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch07.html">← Ch7. Transactions</a
+        ><a href="index.html">목차 →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "분산 시스템을 단일 컴퓨터와 근본적으로 다르게 만드는 특징은?",
+          options: [
+            "CPU 코어가 더 많다는 것",
+            "partial failure — 일부만 망가지고 나머지는 동작하며, 그마저 비결정적이라는 것",
+            "프로그래밍 언어가 다르다는 것",
+            "항상 더 빠르다는 것",
+          ],
+          answer: 1,
+          expl: "단일 머신은 결정적(전부 아니면 전무)이지만, 분산 시스템은 일부만 망가지는 partial failure가 특징이며 그것이 비결정적이라는 점이 근본 차이다.",
+        },
+        {
+          type: "mcq",
+          q: "HPC(supercomputer)와 cloud computing의 fault 철학 비교로 옳은 것은?",
+          options: [
+            "HPC는 부분 실패를 전체 실패로 승격시켜 checkpoint에서 재시작하고, cloud는 fault를 전제로 소프트웨어에서 fault tolerance를 구축한다",
+            "HPC는 fault tolerance가 완벽하고 cloud는 없다",
+            "둘 다 노드 장애 시 전체를 재시작한다",
+            "cloud는 특수 하드웨어로 fault를 원천 차단한다",
+          ],
+          answer: 0,
+          expl: "HPC는 한 노드 장애 시 전체를 멈추고 checkpoint에서 재시작(단일 머신처럼 취급). cloud는 상용 하드웨어에서 fault를 상수로 보고 소프트웨어 차원의 fault tolerance로 무중단 서비스를 만든다.",
+        },
+        {
+          type: "mcq",
+          q: "네트워크 요청에 응답이 없을 때에 대한 설명으로 옳은 것은?",
+          options: [
+            "요청이 유실된 것이 확실하다",
+            "원격 노드가 crash한 것이 확실하다",
+            "요청 유실·큐 대기·원격 crash·일시 정지·응답 유실 등을 구별할 수 없다 — 요청이 처리됐는지조차 모른다",
+            "TCP를 쓰면 원인을 항상 알 수 있다",
+          ],
+          answer: 2,
+          expl: "요청 유실, 큐 대기, 원격 crash, 일시 정지(GC), 응답 유실, 응답 지연을 응답 없이는 구별할 수 없다. timeout으로 포기할 수는 있지만 처리 여부는 여전히 모른다.",
+        },
+        {
+          type: "mcq",
+          q: "timeout을 너무 짧게 잡았을 때의 위험이 아닌 것은?",
+          options: [
+            "살아 있는(느린) 노드를 성급하게 죽었다고 선언한다",
+            "노드가 하던 작업을 다른 노드가 또 수행해 중복이 생길 수 있다",
+            "과부하 상황에서 부하 이전이 cascading failure를 일으킬 수 있다",
+            "죽은 노드의 선언까지 너무 오래 기다리게 된다",
+          ],
+          answer: 3,
+          expl: "오래 기다리는 것은 timeout이 너무 길 때의 문제. 짧은 timeout의 위험은 성급한 사망 선고 → 작업 중복 수행, 그리고 부하 이전에 의한 cascading failure다.",
+        },
+        {
+          type: "mcq",
+          q: "네트워크 지연의 변동성(variability)의 주된 원인은?",
+          options: [
+            "빛의 속도의 변화",
+            "여러 지점에서의 queueing — 스위치 큐, OS 큐, VM 스케줄링, TCP flow control·재전송",
+            "케이블 길이의 차이",
+            "패킷 크기의 차이",
+          ],
+          answer: 1,
+          expl: "지연 변동의 주범은 queueing: 스위치 큐(혼잡 시 drop), 바쁜 CPU의 OS 큐, VM 스케줄링 대기, TCP flow control, 유실 패킷의 TCP 재전송 대기. 멀티테넌트 환경에서 특히 심하다.",
+        },
+        {
+          type: "mcq",
+          q: "전화망(circuit-switched)이 bounded delay를 보장할 수 있는 이유는?",
+          options: [
+            "패킷이 더 작아서",
+            "통화 설정 시 경로 전체에 고정 대역폭을 예약해 queueing이 없기 때문",
+            "광케이블만 사용해서",
+            "TCP보다 빠른 프로토콜을 써서",
+          ],
+          answer: 1,
+          expl: "circuit 설정 시 경로의 모든 구간에 대역폭이 예약되므로 큐잉이 없고 end-to-end 지연이 고정된다(synchronous network). 대신 예약된 자원은 남이 못 쓴다.",
+        },
+        {
+          type: "mcq",
+          q: "TCP/이더넷이 회선 예약 대신 packet switching을 택한 이유는?",
+          options: [
+            "구현이 더 단순해서",
+            "데이터 전송이 bursty하므로, 동적으로 대역폭을 나눠 링크 활용률을 극대화하기 위해 (latency 보장과 자원 활용률의 trade-off)",
+            "지연 보장이 더 강해서",
+            "보안 때문에",
+          ],
+          answer: 1,
+          expl: "데이터는 bursty해서 고정 대역폭 예약이 비효율적이다. packet switching은 가용 대역폭에 동적으로 적응해 활용률을 극대화한다 — latency 보장 vs 자원 활용(비용)의 trade-off에서 후자를 택한 것.",
+        },
+        {
+          type: "mcq",
+          q: "duration(경과 시간) 측정, 특히 timeout 측정에 써야 하는 시계는?",
+          options: [
+            "time-of-day clock — NTP로 정확히 동기화되므로",
+            "monotonic clock — 항상 전진하며 NTP가 점프시키지 않으므로",
+            "NTP 서버의 시계를 직접 조회",
+            "어느 쪽이든 무방하다",
+          ],
+          answer: 1,
+          expl: "time-of-day clock은 NTP 동기화로 뒤로 점프할 수 있어 duration 측정에 부적합하다. monotonic clock은 절대값은 무의미하지만 항상 전진하므로 timeout·경과 시간 측정에 적합하다.",
+        },
+        {
+          type: "mcq",
+          q: "multi-leader 복제에서 LWW(last write wins)가 위험한 이유는?",
+          options: [
+            "쓰기가 너무 느려져서",
+            "시계가 느린 노드의 인과적으로 나중인 쓰기가, 시계 빠른 노드의 이전 쓰기에게 에러 없이 조용히 패배해 버려질 수 있어서 (causality 위반)",
+            "저장 공간을 두 배로 써서",
+            "읽기 성능이 떨어져서",
+          ],
+          answer: 1,
+          expl: "timestamp 순서가 인과 순서와 다를 수 있다. 시계 느린 노드의 최신 쓰기가 조용히(에러 없이) 버려진다 — silent data loss. 순서에는 물리 시계 대신 logical clock을 써야 한다.",
+        },
+        {
+          type: "mcq",
+          q: "Google Spanner가 TrueTime의 confidence interval을 다루는 방법은?",
+          options: [
+            "구간의 중간값을 진짜 시간으로 간주한다",
+            "commit 전에 confidence interval 길이만큼 의도적으로 기다려 구간 겹침을 없앤다 (GPS·원자시계로 구간 자체를 짧게 유지)",
+            "시계를 아예 쓰지 않는다",
+            "가장 빠른 노드의 시계를 기준으로 삼는다",
+          ],
+          answer: 1,
+          expl: "두 트랜잭션의 confidence interval이 겹치지 않아야 순서가 확실하므로, Spanner는 commit 전에 구간 길이만큼 대기한다(waiting out the uncertainty). GPS·원자시계로 구간을 ~7ms로 유지해 대기를 짧게 만든다.",
+        },
+        {
+          type: "mcq",
+          q: "process pause의 원인으로 책이 들지 않은 것은?",
+          options: [
+            "stop-the-world GC",
+            "VM suspend와 CPU steal",
+            "swap/thrashing과 SIGSTOP",
+            "CPU 클럭 속도의 향상",
+          ],
+          answer: 3,
+          expl: "책이 든 원인: stop-the-world GC, VM suspend/live migration, 노트북 뚜껑, context switch·CPU steal, 디스크 I/O, swap/thrashing, SIGSTOP. CPU가 빨라지는 것은 pause의 원인이 아니다.",
+        },
+        {
+          type: "mcq",
+          q: "lease를 가진 leader가 GC pause 후 겪는 문제의 핵심은?",
+          options: [
+            "lease가 자동 연장되어 버린다",
+            "pause 동안 lease가 만료되고 다른 노드가 leader가 되었는데, 깨어난 노드는 자신이 멈췄다는 사실조차 모른 채 leader처럼 행동한다",
+            "GC가 lease 데이터를 삭제한다",
+            "네트워크 연결이 끊어진다",
+          ],
+          answer: 1,
+          expl: "스레드는 lease 만료 확인과 쓰기 사이에 얼마든지 멈출 수 있다. 깨어난 노드는 시간이 흘렀음을 모른 채 만료된 lease로 쓰기를 계속한다 — fencing token이 필요한 이유.",
+        },
+        {
+          type: "mcq",
+          q: '"진실은 다수결로 정의된다"의 의미로 옳은 것은?',
+          options: [
+            "데이터 값은 항상 다수결 투표로 정한다",
+            "노드는 자기 자신의 판단(살아 있음 등)을 믿을 수 없고, quorum 과반이 죽었다고 선언하면 죽은 것으로 간주된다",
+            "사용자가 많은 쪽 서버가 옳다",
+            "관리자가 많은 시스템이 옳다",
+          ],
+          answer: 1,
+          expl: "반쪽 단절 노드나 GC로 멈췄던 노드는 자신이 멀쩡하다고 믿어도 소용없다. 분산 알고리즘은 quorum(과반)의 투표에 의존하며, 과반의 선언이 개별 노드의 자기 인식을 이긴다.",
+        },
+        {
+          type: "mcq",
+          q: "fencing token이 필요한 이유는?",
+          options: [
+            "네트워크 암호화를 위해",
+            "lock/lease만으로는 낡은 보유자(pause 후 깨어난 노드)의 쓰기를 막을 수 없으므로, 단조 증가 토큰을 storage가 검사해 오래된 쓰기를 거부하기 위해",
+            "쓰기 속도를 높이기 위해",
+            "토큰이 있으면 lock이 필요 없어지므로",
+          ],
+          answer: 1,
+          expl: "lock 보유자가 스스로 유효성을 판단하게 두면 pause 후 낡은 lease로 쓰기를 한다. lock 발급마다 단조 증가 토큰을 주고 storage 측에서 검사해, 더 높은 토큰이 이미 지나갔으면 낮은 토큰의 쓰기를 거부한다.",
+        },
+        {
+          type: "mcq",
+          q: "Byzantine fault tolerance에 대한 설명으로 옳은 것은?",
+          options: [
+            "모든 데이터 시스템의 기본 요구사항이다",
+            "항공우주(방사선 오염)나 블록체인(상호 불신 참여자)처럼 노드가 거짓말할 수 있는 환경에서 필요하며, 한 조직이 전 노드를 통제하는 대부분의 데이터 시스템은 non-Byzantine을 가정한다",
+            "checksum만 쓰면 완전한 BFT가 된다",
+            "crash-stop 모델과 같은 뜻이다",
+          ],
+          answer: 1,
+          expl: "BFT는 방사선에 의한 임의 오염(항공우주)이나 상호 불신 참여자(블록체인)에 필요. 대부분의 데이터 시스템은 전 노드를 한 조직이 통제하므로 non-Byzantine 가정 + checksum·입력 검증·다중 NTP 서버 같은 약한 방어로 충분하다.",
+        },
+        {
+          type: "ox",
+          q: "TCP 연결에서 RST/FIN 패킷, ICMP Destination Unreachable 같은 피드백이 있으므로 timeout 없이도 노드 장애를 항상 감지할 수 있다.",
+          answer: false,
+          expl: "RST/FIN, crash 통지 스크립트, 링크 다운 감지, ICMP는 있을 수도 없을 수도 있는 부가 피드백일 뿐이다. 요청 처리를 확신하려면 애플리케이션의 긍정 응답이 필요하고, 일반적으로는 timeout에 의존해야 한다.",
+        },
+        {
+          type: "ox",
+          q: "대부분의 실제 분산 시스템 설계에 가장 유용한 system model 조합은 partially synchronous 타이밍 + crash-recovery 노드 실패 모델이다.",
+          answer: true,
+          expl: "synchronous 모델은 비현실적이고 asynchronous 모델은 너무 제한적이다. '대부분은 정상, 가끔 한도 초과'인 partially synchronous + 'crash 후 재시작 가능(디스크 보존, 메모리 유실)'인 crash-recovery가 실무에 가장 유용하다.",
+        },
+        {
+          type: "ox",
+          q: 'safety 속성은 "좋은 일이 결국 일어난다"는 보장이고, liveness 속성은 "나쁜 일이 일어나지 않는다"는 보장이다.',
+          answer: false,
+          expl: "반대다. safety = '나쁜 일이 일어나지 않는다'(위반 시점 특정 가능, 되돌릴 수 없음, 항상 성립해야 함), liveness = '좋은 일이 결국(eventually) 일어난다'(조건부 보장 허용).",
+        },
+        {
+          type: "short",
+          q: "Akka·Cassandra가 사용하는, 응답 시간 분포를 지속적으로 측정해 timeout(장애 의심 정도)을 자동 조정하는 failure detector의 이름은?",
+          answers: ["phi accrual failure detector", "phi accrual"],
+          expl: "Phi Accrual failure detector — 응답 시간의 분포를 지속 측정해 장애 의심도(phi)를 계산, timeout을 관측된 분포에 맞춰 자동 조정한다. TCP의 재전송 timeout도 유사한 원리.",
+        },
+        {
+          type: "short",
+          q: "노드가 crash뿐 아니라 임의의 오작동·거짓 응답까지 할 수 있다고 가정하는 fault의 이름은? (비잔틴 장군 문제에서 유래)",
+          answers: ["byzantine fault", "비잔틴 폴트", "비잔틴 장애"],
+          expl: "Byzantine fault — 노드가 crash를 넘어 임의의 오작동·거짓 응답('거짓말')까지 할 수 있는 fault. 이를 견디는 시스템을 Byzantine fault-tolerant하다고 한다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>
