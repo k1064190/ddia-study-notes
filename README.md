@@ -38,7 +38,7 @@ Martin Kleppmann의 *Designing Data-Intensive Applications* (DDIA)를 챕터별�
 - [x] [Ch5. Replication](notes/ch05-replication.md)
 - [x] [Ch6. Partitioning](notes/ch06-partitioning.md)
 - [x] [Ch7. Transactions](notes/ch07-transactions.md)
-- [ ] Ch8. The Trouble with Distributed Systems
+- [x] [Ch8. The Trouble with Distributed Systems](notes/ch08-trouble-with-distributed-systems.md)
 - [ ] Ch9. Consistency and Consensus
 
 ### Part III — Derived Data
