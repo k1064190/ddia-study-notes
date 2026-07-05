@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch2. Data Models and Query Languages — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html" class="active">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+    <a href="ch05.html">Ch5</a>
+    <a href="ch06.html">Ch6</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Chapter 2. Data Models and Query Languages</h1>
+      <p class="subtitle">
+        데이터의 관계 구조가 데이터 모델을 결정한다 — relational, document,
+        graph 모델과 그에 딸린 query language들의 비교.
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        <strong>Data model</strong>은 소프트웨어가 어떻게 만들어지는지뿐 아니라
+        우리가 풀려는 문제를 <em>어떻게 사고하는지</em>까지 바꾸는, 가장 중요한
+        설계 요소다. 대부분의 애플리케이션은 여러 data model을 층층이 쌓아
+        만든다. 각 층의 핵심 질문은 "이 층은 아래 층 위에서 어떻게
+        표현되는가?"이다. 예를 들어 애플리케이션 객체 → JSON/관계형 테이블 →
+        디스크 바이트 → 전기 신호로 내려간다.
+      </p>
+      <p>
+        이 챕터는 데이터를 저장하고 질의하기 위한 다양한 모델을 비교한다. 크게
+        세 가지다.
+      </p>
+      <ul>
+        <li><strong>Relational model</strong> (SQL)</li>
+        <li><strong>Document model</strong> (NoSQL의 한 갈래)</li>
+        <li><strong>Graph-based model</strong></li>
+      </ul>
+      <p>
+        그리고 각 모델에 딸린 <strong>query language</strong>들(SQL, MapReduce,
+        Cypher, SPARQL, Datalog)을 다룬다. 핵심 메시지는 하나다.
+      </p>
+      <blockquote>
+        정답인 단일 모델은 없다. 데이터의 관계 구조에 맞는 모델을 골라야 한다.
+      </blockquote>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>1. Relational Model vs Document Model</h3>
+
+      <h4>관계형 모델의 배경</h4>
+      <p>
+        1970년 Edgar Codd가 제안한 <strong>relational model</strong>은 데이터를
+        <strong>relation</strong>(SQL의 table)으로, 각 relation을 정렬되지 않은
+        <strong>tuple</strong>(row)들의 모음으로 표현한다. 비즈니스 데이터
+        처리(transaction processing, batch processing)에서 수십 년간
+        지배적이었고, 구현 디테일을 깔끔한 인터페이스 뒤로 숨기는 데 크게
+        성공했다.
+      </p>
+
+      <h4>NoSQL의 탄생</h4>
+      <p>
+        2010년대 <strong>NoSQL</strong>(원래는 트위터 해시태그였고, 후에 "Not
+        Only SQL"로 재해석)이 부상한 동기는 다음과 같다.
+      </p>
+      <ul>
+        <li>
+          매우 큰 데이터셋이나 높은 write throughput에 대한
+          <strong>더 나은 scalability</strong> 필요
+        </li>
+        <li>상용 RDBMS보다 <strong>무료/오픈소스</strong> 선호</li>
+        <li>관계형 모델이 잘 지원하지 못하는 특수 질의 연산</li>
+        <li>
+          관계형 스키마의 제약에 대한 불만, 더
+          <strong>동적이고 표현력 있는</strong> 데이터 모델에 대한 욕구
+        </li>
+      </ul>
+      <p>
+        저자의 전망: 미래는 관계형과 비관계형의
+        <strong>polyglot persistence</strong>(공존)이다.
+      </p>
+
+      <h4>Object-Relational Mismatch (임피던스 불일치)</h4>
+      <p>
+        객체지향 코드의 객체와 관계형 테이블/행/열 사이에는 어색한 변환
+        층(<strong>impedance mismatch</strong>)이 필요하다.
+        <strong>ORM</strong>(Object-Relational Mapping) 프레임워크가 이
+        boilerplate를 줄여주지만 완전히 없애지는 못한다.
+      </p>
+      <p>
+        이력서(LinkedIn 프로필) 같은 데이터는 본질적으로
+        <strong>하나의 객체 + 그에 딸린 one-to-many 구조</strong>(여러 직장,
+        여러 학력, 여러 연락처)다. 관계형에서는 별도 테이블 + foreign key로
+        쪼개지만, JSON 같은 <strong>document model</strong>로는 자기완결적
+        트리(self-contained tree)로 자연스럽게 표현된다. 이때
+        <strong>locality(지역성)</strong>의 이점도 있다: 프로필 전체를 한 번의
+        조회로 가져올 수 있다.
+      </p>
+
+      <h4>Many-to-One과 Many-to-Many 관계</h4>
+      <p>
+        도시·지역·산업 같은 값을
+        <strong>ID로 정규화(normalization)</strong>하면(중복 제거) 표기 일관성,
+        한 곳만 수정하면 되는 갱신 편의, localization 지원, 검색 용이라는 이점이
+        있다. ID는 사람에게 의미가 없어 바뀔 일이 없다는 것이 핵심이다.
+      </p>
+      <p>
+        하지만 ID로 참조하면 <strong>many-to-one</strong>(여러 사람이 한 도시)
+        관계가 생기고, 이는 document model이 약한 부분이다(join 지원이 약함).
+        데이터는 시간이 지나며 점점 상호 연결되어
+        <strong>many-to-many</strong> 관계가 늘어나는 경향이 있다(예: 추천서를
+        쓴 사람도 시스템의 사용자가 된다).
+      </p>
+
+      <h4>Document 데이터베이스는 역사를 반복하는가?</h4>
+      <ul>
+        <li>
+          <strong>Hierarchical model</strong> (1970년대 IBM IMS): 데이터를
+          트리로 표현 → JSON과 유사. 하지만 many-to-many를 잘 다루지 못했고
+          join이 없었다.
+        </li>
+        <li>
+          이를 풀기 위한 두 해법:
+          <ul>
+            <li>
+              <strong>Network model</strong> (CODASYL): 레코드가 여러 부모를
+              가질 수 있는 그래프. <strong>access path</strong>를 코드로 직접
+              따라가야 해서 복잡하고 유연성이 낮았다.
+            </li>
+            <li>
+              <strong>Relational model</strong>: query optimizer가 access path를
+              자동으로 정해줌 → 선언적이고 유연.
+            </li>
+          </ul>
+        </li>
+        <li>
+          즉 document model은 어떤 면에서 hierarchical model의 부활이지만,
+          many-to-one/many-to-many는 관계형처럼
+          <strong>document reference</strong>(foreign key와 유사)로 표현하고
+          보통 application 코드에서 해소한다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — document model과 CODASYL의 결정적 차이는
+        <em>join이 언제, 어디서 일어나는가</em>다. CODASYL은 insert 시점에
+        디스크 포인터를 박아 접근 경로가 데이터의 물리적 모양에 고정되었다 —
+        원하는 데이터에 가려면 그 경로를 코드로 한 걸음씩 따라가야 했고, 데이터
+        모양이 바뀌면 질의 코드 전체가 깨졌다. 반면 document model은 관계를
+        <strong>read 시점에</strong> ID(document reference)로 해소한다. 접근이
+        데이터의 저장 모양에 묶이지 않으므로 CODASYL의 근본 문제를 되살리지
+        않는다. 흔한 오해: "document DB = 계층형 DB의 단순 회귀"라는 인식 —
+        트리라는 모양은 닮았지만 참조 해소 메커니즘은 relational 쪽에 가깝다.
+      </div>
+
+      <h4>오늘날 Relational vs Document — 어느 것을 쓸까?</h4>
+      <table>
+        <thead>
+          <tr>
+            <th>기준</th>
+            <th>Document model이 유리</th>
+            <th>Relational model이 유리</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Application 코드 단순성</td>
+            <td>
+              데이터가 트리 형태(one-to-many)이고 한 번에 전체를 로드할 때
+            </td>
+            <td>
+              many-to-many 관계가 많을 때(join). document로 하면 비정규화 유지나
+              application-level join이 필요해 복잡하고 느려진다
+            </td>
+          </tr>
+          <tr>
+            <td>Schema flexibility</td>
+            <td>
+              <strong>schema-on-read</strong>: 항목들이 제각각이거나 외부가
+              구조를 결정할 때
+            </td>
+            <td>
+              <strong>schema-on-write</strong>: 모든 레코드가 같은 구조를
+              가진다고 보장하고 싶을 때
+            </td>
+          </tr>
+          <tr>
+            <td>Data locality</td>
+            <td>
+              document 전체를 자주 통째로 읽을 때(단, document가 작을 때 권장)
+            </td>
+            <td>document 일부만 필요한 접근이 많을 때(전체 로드는 낭비)</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>심층 설명</strong> — schema-on-read vs schema-on-write의 본질은
+        "스키마 유무"가 아니라 <em>스키마 검증 시점</em>이다. document DB의
+        "schemaless"는 오해다: 읽는 코드가 어떤 구조를 가정하므로
+        <strong>암묵적 스키마</strong>는 항상 존재하고, DB가 강제하지 않을
+        뿐이다. 동적 타입 언어의 런타임 체크(schema-on-read) vs 정적 타입 언어의
+        컴파일 타임 체크(schema-on-write) 비유가 정확하다. 실무적 함의는
+        마이그레이션에서 드러난다: document는 코드에서 옛/새 포맷을 함께
+        처리하고, relational은 <code>ALTER TABLE</code>(대부분 ms 단위로
+        빠르지만, <strong>MySQL은 테이블 전체를 복사</strong>해 대용량이면
+        분~시간이 걸리는 예외) + <code>UPDATE</code>(큰 테이블에서는 느릴 수
+        있어, 새 컬럼을 NULL로 두고 읽을 때 채우는 우회를 쓰기도 한다)로
+        처리한다.
+      </div>
+      <p>
+        locality는 document model만의 개념이 아니다. Google Spanner, Oracle의
+        multi-table index cluster table, Cassandra/HBase의 column-family도 관련
+        데이터를 가까이 저장한다.
+      </p>
+      <p>
+        <strong>Convergence(수렴)</strong>: 현대 관계형 DB는 JSON/XML을
+        지원하고(PostgreSQL 9.3, <strong>MySQL 5.7</strong>, IBM DB2 10.5),
+        document DB(RethinkDB, 최근 MongoDB)는 join 비슷한 기능을 추가하고 있다.
+        두 모델은 점점 닮아가며, 결국 <strong>hybrid</strong>가 미래로 보인다.
+      </p>
+
+      <h3>2. Query Languages for Data</h3>
+
+      <h4>Declarative vs Imperative</h4>
+      <ul>
+        <li>
+          <strong>Imperative(명령형)</strong>: <em>어떻게</em> 할지 단계별로
+          지시(반복문, 조건문 등). 예: 일반 코드, IMS/CODASYL.
+        </li>
+        <li>
+          <strong>Declarative(선언형)</strong>: <em>무엇을</em> 원하는지(결과
+          조건)만 기술하고, <em>어떻게</em>는 시스템(query optimizer)에 맡김.
+          예: SQL, relational algebra.
+        </li>
+      </ul>
+      <p>declarative의 장점:</p>
+      <ul>
+        <li>간결하고 다루기 쉬움</li>
+        <li>
+          구현 디테일(예: 인덱스 사용)을 숨겨, DB가 성능을 개선해도 query를 바꿀
+          필요가 없음
+        </li>
+        <li>
+          <strong>병렬 실행(parallel execution)</strong>에 유리 — 실행 순서를
+          명시하지 않으므로 멀티코어 활용이 쉬움
+        </li>
+      </ul>
+      <p>
+        <strong>웹에서의 declarative 예</strong>: <strong>CSS</strong>(선택자로
+        "무엇"을 스타일링할지 선언) vs JavaScript로 DOM을 직접 조작하는 명령형
+        방식. CSS가 훨씬 낫다.
+      </p>
+      <div class="callout">
+        <strong>심층 설명</strong> — declarative의 진짜 이점은 "짧아서"가 아니라
+        <em>실행 방법에 대한 통제를 포기한 대가로 얻는 자유</em>다.
+        순서·알고리즘을 명시하지 않았기 때문에 (1) query optimizer가 통계
+        기반으로 access path/인덱스/join 순서를 마음껏 바꿀 수 있고, (2) DB
+        엔진이 버전업되면
+        <strong>내 query를 한 글자도 안 고치고</strong> 빨라지며, (3) 결과의
+        패턴만 지정했으므로 엔진이 멀티코어에 작업을 쪼개도 의미가 보존된다.
+        흔한 오해: "선언형은 느리다" — 오히려 명령형으로 실행 순서를 박아두면
+        엔진이 최적화할 여지를 없애는 것이다. 인덱스 힌트나 join 순서 강제를
+        남발한다면 사실상 선언형의 이점을 스스로 버리는 셈이다.
+      </div>
+
+      <h4>MapReduce Querying</h4>
+      <p>
+        <strong>MapReduce</strong>는 선언형과 명령형의 중간이다. 많은 머신에
+        걸쳐 대량 데이터를 처리하는 프로그래밍 모델로, <strong>map</strong>(각
+        document에서 key-value 방출)과 <strong>reduce</strong>(같은 key의 값들을
+        집계) 함수를 사용자가 작성한다. 두 함수는
+        <strong>순수 함수(pure function)</strong>여야 한다 — 입력만 사용하고
+        부작용이 없어야, 어느 머신에서든 어떤 순서로든, 실패 시 재실행까지
+        안전하게 할 수 있다.
+      </p>
+      <p>
+        다만 두 함수가 잘 맞물리도록(coordinated) 직접 설계해야 해서 단일 선언형
+        쿼리보다 부담이 크다. 이것이 MongoDB가 같은 일을 더 선언적으로 하는
+        <strong>aggregation pipeline</strong>을 도입한 동기다 — 책의 표현을
+        빌리면, NoSQL 시스템이 "자기도 모르게 SQL을 재발명(accidentally
+        reinventing SQL, albeit in disguise)"하는 셈이다.
+      </p>
+
+      <h3>3. Graph-Like Data Models</h3>
+      <p>
+        many-to-many 관계가 매우 흔하고 복잡하면 데이터를
+        <strong>graph</strong>(vertex/node + edge/relationship)로 모델링하는
+        것이 자연스럽다. 예: 소셜 그래프, 웹 그래프, 도로/철도 네트워크.
+        그래프는 <strong>동질적(homogeneous)</strong> 데이터에 국한되지 않는다 —
+        사람·장소·이벤트 등 이질적 객체를 한 그래프에 담을 수 있다(예:
+        Facebook).
+      </p>
+
+      <h4>Property Graph Model (예: Neo4j, Titan, InfiniteGraph)</h4>
+      <ul>
+        <li>
+          각 <strong>vertex</strong>: 고유 ID, 나가는/들어오는 edge 집합,
+          properties(key-value 모음)
+        </li>
+        <li>
+          각 <strong>edge</strong>: 고유 ID, 시작/끝 vertex,
+          <strong>label</strong>(관계의 종류), properties
+        </li>
+        <li>
+          특징: 어떤 vertex든 어떤 vertex와 연결 가능, 특정 vertex에서 들어오고
+          나가는 edge를 효율적으로 탐색 가능, 서로 다른 label로 한 그래프에 여러
+          종류의 정보 저장 → 진화·확장에 유연
+        </li>
+      </ul>
+      <p>
+        <strong>Cypher</strong>는 Neo4j의 declarative query language로, 패턴
+        매칭으로 그래프를 질의한다. 책의 예제에서는 같은 질의가 Cypher로는 4줄,
+        SQL로는 <code>WITH RECURSIVE</code>를 동원해 29줄이 필요했다.
+      </p>
+
+      <h4>Triple-Stores와 SPARQL</h4>
+      <p>
+        <strong>Triple-store</strong>는 모든 정보를
+        <strong>(subject, predicate, object)</strong> 세 요소의 triple로
+        저장한다. 예: <code>(Jim, likes, bananas)</code>. subject는 graph의
+        vertex에 해당하고, object는 (1) 원시 값(property)이거나 (2) 다른
+        vertex(이때 predicate는 edge)일 수 있다. 즉 triple-store와 property
+        graph는 표기만 다를 뿐 사실상 같은 모델이다. 참고로 대표적
+        triple-store로 꼽히는 <strong>Datomic</strong>은 엄밀히는 triple이
+        아니라 <strong>5-tuple</strong>을 쓴다 — 추가된 두 필드는 versioning을
+        위한 metadata다.
+      </p>
+      <p>
+        <strong>RDF</strong>(Resource Description Framework)는 semantic web을
+        위한 triple 표현 표준이다. URI로 전역 식별하며 Turtle/XML 등의 포맷이
+        있다. (semantic web 자체는 실무에서 크게 성공하지는 못했다.)
+      </p>
+      <p>
+        <strong>SPARQL</strong>은 RDF triple-store용 declarative query
+        language다. 풀네임은 "<strong>S</strong>PARQL <strong>P</strong>rotocol
+        <strong>a</strong>nd <strong>R</strong>DF <strong>Q</strong>uery
+        <strong>L</strong>anguage"이고 "sparkle"이라고 발음한다. Cypher보다 먼저
+        나왔고, Cypher의 패턴 매칭은 SPARQL에서 차용한 것이다.
+      </p>
+
+      <h4>Datalog</h4>
+      <p>
+        더 오래된(1980년대) 기반 언어다. 데이터를
+        <strong>predicate(subject, object)</strong> 형태의 fact로 표현하고,
+        <strong>rule</strong>(다른 predicate로부터 새 predicate를 유도)로 질의를
+        조합한다. rule이 자기 자신을 참조할 수 있어 재귀 질의(임의 깊이의 포함
+        관계 등)를 자연스럽게 표현하며, Cypher/SPARQL의 이론적 토대다. 실사용
+        예로는 Datomic, Cascalog가 있다.
+      </p>
+
+      <h4>그래프 모델 vs 네트워크 모델(CODASYL)</h4>
+      <p>표면상 비슷해 보이지만 다르다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>CODASYL (network model)</th>
+            <th>Graph model</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>schema가 어떤 레코드가 어디에 중첩될 수 있는지 강하게 제약</td>
+            <td>그런 제약 없음 — 어떤 vertex든 어떤 vertex와 연결 가능</td>
+          </tr>
+          <tr>
+            <td>
+              원하는 데이터에 도달하려면 특정 access path를 코드로 따라가야 함
+            </td>
+            <td>어떤 vertex든 ID로 직접 참조하거나 인덱스로 찾을 수 있음</td>
+          </tr>
+          <tr>
+            <td>자식이 순서 있는 집합이라 DB가 정렬을 유지해야 함</td>
+            <td>vertex/edge에 정렬 없음</td>
+          </tr>
+          <tr>
+            <td>질의가 명령형이라 스키마 변경에 취약</td>
+            <td>질의가 선언형(Cypher/SPARQL/Datalog)</td>
+          </tr>
+        </tbody>
+      </table>
+      <blockquote>
+        상호 연결이 강한 데이터일수록 — document model은 어색하고(awkward),
+        relational model은 그럭저럭(acceptable), graph model이 가장
+        자연스럽다(most natural).
+      </blockquote>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Impedance mismatch = 둥근 구멍에 네모난 못</h3>
+        <p>
+          둥근 구멍(객체)에 네모난 못(테이블 행)을 맞추는 일. ORM은 그 사이에
+          끼우는 어댑터지만, 모양이 본질적으로 달라 마찰이 완전히 사라지지는
+          않는다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>One-to-many는 document, many-to-many는 relational</h3>
+        <p>
+          한 사람의 이력서는 그 사람 "밑에" 자연스럽게 트리로
+          매달린다(직장·학력) → document가 편하다. 반면 "이 회사에서 일한 모든
+          사람", "이 사람을 추천한 모든 사람"처럼 서로 얽히면(many-to-many) 별도
+          테이블 + join이 깔끔하다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Schema-on-read vs schema-on-write = 이삿짐 상자</h3>
+        <p>
+          "그냥 넣고 열 때 확인"(schema-on-read, 동적 타입) vs "넣기 전에 라벨
+          규칙을 강제"(schema-on-write, 정적 타입). 항목이 제각각이면 전자가,
+          일관성·안정성이 중요하면 후자가 낫다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Declarative vs Imperative = "파란 글씨로 만들어줘"</h3>
+        <p>
+          "파란 글씨로 만들어줘"(선언, SQL/CSS) vs "각 글자를 찾아 색을 바꾸는
+          루프를 직접 짠다"(명령, 코드/DOM 조작). 선언형은 <em>무엇</em>만
+          말하고 <em>어떻게</em>는 엔진에 맡기므로, 엔진이 더 똑똑해지면 내
+          코드는 그대로 둬도 빨라진다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Graph 모델 = 지하철 노선도</h3>
+        <p>
+          역(vertex)과 노선(edge)으로 "A역에서 B역까지 환승 2번 이내 경로"를
+          묻는 것이, 같은 질의를 관계형 테이블의 여러 self-join으로 짜는 것보다
+          훨씬 자연스럽다.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Data model</strong></td>
+            <td>데이터를 어떻게 표현·구조화하고 사고할지 정하는 추상 모델</td>
+          </tr>
+          <tr>
+            <td><strong>Relational model</strong></td>
+            <td>데이터를 relation(table)과 tuple(row)로 표현하는 모델 (SQL)</td>
+          </tr>
+          <tr>
+            <td><strong>NoSQL</strong></td>
+            <td>비관계형 데이터스토어의 총칭 ("Not Only SQL")</td>
+          </tr>
+          <tr>
+            <td><strong>Polyglot persistence</strong></td>
+            <td>한 시스템에서 관계형·비관계형 등 여러 저장소를 함께 쓰는 것</td>
+          </tr>
+          <tr>
+            <td><strong>Impedance mismatch</strong></td>
+            <td>객체지향 코드와 관계형 테이블 사이의 변환 마찰</td>
+          </tr>
+          <tr>
+            <td><strong>ORM</strong></td>
+            <td>
+              Object-Relational Mapping; 객체↔테이블 변환 boilerplate를 줄이는
+              도구
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Document model</strong></td>
+            <td>데이터를 JSON/XML 같은 자기완결적 트리 문서로 저장하는 모델</td>
+          </tr>
+          <tr>
+            <td><strong>One-to-many</strong></td>
+            <td>한 레코드가 여러 하위 레코드를 갖는 관계(트리)</td>
+          </tr>
+          <tr>
+            <td><strong>Many-to-one / Many-to-many</strong></td>
+            <td>여러 레코드가 하나/서로 다수를 참조하는 관계</td>
+          </tr>
+          <tr>
+            <td><strong>Normalization</strong></td>
+            <td>중복을 ID 참조로 제거하는 것</td>
+          </tr>
+          <tr>
+            <td><strong>Locality</strong></td>
+            <td>관련 데이터를 가까이 저장해 한 번에 읽게 하는 성질</td>
+          </tr>
+          <tr>
+            <td><strong>Hierarchical model</strong></td>
+            <td>데이터를 트리로 표현한 옛 모델 (IBM IMS)</td>
+          </tr>
+          <tr>
+            <td><strong>Network model (CODASYL)</strong></td>
+            <td>
+              레코드가 여러 부모를 갖는 그래프형 옛 모델; access path를 코드로
+              탐색
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Access path</strong></td>
+            <td>원하는 데이터에 도달하기 위해 따라가는 경로</td>
+          </tr>
+          <tr>
+            <td><strong>Schema-on-read</strong></td>
+            <td>읽을 때 구조를 해석(암묵적 스키마); document DB에 흔함</td>
+          </tr>
+          <tr>
+            <td><strong>Schema-on-write</strong></td>
+            <td>쓸 때 스키마를 강제(명시적); relational DB의 방식</td>
+          </tr>
+          <tr>
+            <td><strong>Declarative query</strong></td>
+            <td>
+              <em>무엇</em>을 원하는지 기술, <em>어떻게</em>는 엔진에 맡김 (SQL,
+              CSS, Cypher)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Imperative query</strong></td>
+            <td><em>어떻게</em> 할지 단계별로 지시 (IMS/CODASYL)</td>
+          </tr>
+          <tr>
+            <td><strong>Query optimizer</strong></td>
+            <td>
+              declarative 질의의 실행 방법(access path 등)을 자동 결정하는 모듈
+            </td>
+          </tr>
+          <tr>
+            <td><strong>MapReduce</strong></td>
+            <td>map/reduce 순수 함수로 분산 대용량 데이터를 처리하는 모델</td>
+          </tr>
+          <tr>
+            <td><strong>Property graph</strong></td>
+            <td>vertex/edge에 properties를 붙이는 그래프 모델 (Neo4j)</td>
+          </tr>
+          <tr>
+            <td><strong>Cypher</strong></td>
+            <td>property graph용 declarative query language</td>
+          </tr>
+          <tr>
+            <td><strong>Triple-store</strong></td>
+            <td>(subject, predicate, object) triple로 저장하는 모델</td>
+          </tr>
+          <tr>
+            <td><strong>RDF</strong></td>
+            <td>semantic web을 위한 triple 표준</td>
+          </tr>
+          <tr>
+            <td><strong>SPARQL</strong></td>
+            <td>
+              RDF triple-store용 declarative query language ("sparkle"로 발음)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Datalog</strong></td>
+            <td>rule 기반의 오래된 declarative 데이터 모델/언어</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        데이터의 관계 구조가 모델 선택을 결정한다 — 트리형(one-to-many)이면
+        <strong>document</strong>, 복잡하게 얽힌 many-to-many면
+        <strong>relational(join)</strong> 또는 <strong>graph</strong>, 그리고
+        declarative query language는 <em>무엇</em>만 기술해 엔진이
+        <em>어떻게</em>를 최적화하게 한다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch01.html">← Ch1. Reliability</a
+        ><a href="ch03.html">Ch3. Storage →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "relational model을 1970년에 제안한 사람은?",
+          options: [
+            "Martin Kleppmann",
+            "Edgar Codd",
+            "Jim Gray",
+            "Michael Stonebraker",
+          ],
+          answer: 1,
+          expl: "relational model은 1970년 Edgar Codd가 제안했다.",
+        },
+        {
+          type: "mcq",
+          q: '"impedance mismatch"가 가리키는 것은?',
+          options: [
+            "네트워크 지연과 디스크 지연의 차이",
+            "객체지향 코드와 관계형 테이블 구조 사이의 변환 마찰",
+            "읽기와 쓰기 처리량의 불균형",
+            "CPU와 메모리 속도 차이",
+          ],
+          answer: 1,
+          expl: "impedance mismatch는 객체(코드)와 테이블(관계형) 구조 차이에서 오는 변환 마찰. ORM이 줄여주지만 없애진 못한다.",
+        },
+        {
+          type: "mcq",
+          q: "다음 중 document model이 relational model보다 유리한 경우는?",
+          options: [
+            "데이터에 many-to-many 관계가 많을 때",
+            "데이터가 트리(one-to-many) 형태이고 보통 한 번에 전체를 로드할 때",
+            "여러 곳에서 동일 값을 참조해 join이 잦을 때",
+            "강한 schema 강제가 핵심 요구일 때",
+          ],
+          answer: 1,
+          expl: "트리형(one-to-many)이고 전체를 한 번에 읽는 데이터는 document가 locality·단순성 면에서 유리. many-to-many·잦은 join은 relational이 낫다.",
+        },
+        {
+          type: "mcq",
+          q: "schema-on-read에 대한 설명으로 옳은 것은?",
+          options: [
+            "데이터에 스키마가 전혀 없다는 뜻이다",
+            "쓸 때 스키마를 강제한다",
+            "구조가 암묵적이며 읽을 때 해석된다 (정적 타입이 아니라 동적 타입에 비유)",
+            "relational DB만의 특징이다",
+          ],
+          answer: 2,
+          expl: 'schema-on-read는 구조가 암묵적이고 읽을 때 해석된다. "스키마가 없다"가 아니라 "쓸 때 강제하지 않을 뿐"이며, 동적 타입 언어에 비유된다.',
+        },
+        {
+          type: "mcq",
+          q: "normalization(정규화)으로 데이터를 ID 참조로 만들 때 생기는 관계는?",
+          options: [
+            "one-to-one만",
+            "many-to-one (여러 레코드가 한 항목을 참조)",
+            "관계가 사라진다",
+            "tree 관계만",
+          ],
+          answer: 1,
+          expl: "값을 ID로 참조하면 many-to-one(여러 사람이 한 도시를 참조)이 생기고, 이는 document가 약한 부분.",
+        },
+        {
+          type: "mcq",
+          q: "declarative query language(SQL 등)의 장점이 아닌 것은?",
+          options: [
+            "구현 디테일을 숨겨 엔진이 최적화해도 query를 안 바꿔도 된다",
+            "병렬 실행에 유리하다",
+            "간결하다",
+            "실행 단계 순서를 개발자가 직접 통제할 수 있다",
+          ],
+          answer: 3,
+          expl: "실행 순서를 개발자가 직접 통제하는 것은 imperative의 특징이다. declarative는 그 통제를 포기하는 대신 최적화·병렬화·간결함을 얻는다.",
+        },
+        {
+          type: "mcq",
+          q: "웹에서 declarative 접근의 대표 예로 책이 든 것은?",
+          options: [
+            "JavaScript DOM 직접 조작",
+            "CSS 선택자",
+            "HTTP 요청",
+            "WebSocket",
+          ],
+          answer: 1,
+          expl: 'CSS가 declarative의 웹 사례. "무엇"을 스타일링할지 선택자로 선언한다.',
+        },
+        {
+          type: "mcq",
+          q: 'document database가 "역사를 반복한다"고 할 때 비교 대상이 된 옛 모델은?',
+          options: [
+            "relational model",
+            "hierarchical model (IBM IMS)",
+            "key-value store",
+            "column-family store",
+          ],
+          answer: 1,
+          expl: "document model은 JSON 트리라는 점에서 hierarchical model(IMS)의 부활에 비유된다. 단, many-to-one/many-to-many는 document reference로 따로 처리.",
+        },
+        {
+          type: "mcq",
+          q: "network model(CODASYL)의 특징으로 옳은 것은?",
+          options: [
+            "query optimizer가 access path를 자동 결정한다",
+            "원하는 데이터까지 access path를 코드로 직접 따라가야 한다",
+            "모든 질의가 declarative다",
+            "레코드는 부모를 가질 수 없다",
+          ],
+          answer: 1,
+          expl: "CODASYL은 access path를 코드로 직접 따라가야 하는 명령형이었다. 자동 최적화는 relational의 것.",
+        },
+        {
+          type: "mcq",
+          q: "MapReduce에서 map과 reduce 함수가 만족해야 하는 조건은?",
+          options: [
+            "부작용이 있어야 한다",
+            "전역 변수를 수정해야 한다",
+            "순수 함수(pure function)여야 한다 (입력만 사용, 부작용 없음)",
+            "반드시 SQL로 작성한다",
+          ],
+          answer: 2,
+          expl: "map/reduce는 순수 함수여야 분산 환경에서 안전하게 재실행·병렬화할 수 있다.",
+        },
+        {
+          type: "mcq",
+          q: "property graph model에서 edge가 갖는 것이 아닌 것은?",
+          options: [
+            "고유 ID",
+            "시작/끝 vertex",
+            "label(관계 종류)",
+            "query optimizer",
+          ],
+          answer: 3,
+          expl: "query optimizer는 declarative 엔진의 구성요소이지 edge의 속성이 아니다. edge는 ID, 시작/끝 vertex, label, properties를 가진다.",
+        },
+        {
+          type: "mcq",
+          q: "triple-store의 기본 저장 단위는?",
+          options: [
+            "(key, value)",
+            "(subject, predicate, object)",
+            "(row, column, table)",
+            "(map, reduce, shuffle)",
+          ],
+          answer: 1,
+          expl: "triple-store는 (subject, predicate, object) 단위로 저장한다. (참고: Datomic은 엄밀히 versioning metadata가 붙은 5-tuple.)",
+        },
+        {
+          type: "mcq",
+          q: "RDF triple-store를 질의하기 위한 declarative 언어는?",
+          options: ["Cypher", "Datalog", "SPARQL", "MapReduce"],
+          answer: 2,
+          expl: 'SPARQL("SPARQL Protocol and RDF Query Language", 발음 "sparkle")이 RDF용 declarative query language. Cypher는 property graph용, Datalog은 rule 기반 토대.',
+        },
+        {
+          type: "mcq",
+          q: "graph model이 데이터 진화·확장에 유리한 이유로 가장 적절한 것은?",
+          options: [
+            "모든 데이터가 반드시 동질적이어야 해서",
+            "서로 다른 label로 한 그래프에 이질적 정보를 담고 어떤 vertex든 연결할 수 있어서",
+            "schema를 항상 강하게 강제해서",
+            "join을 절대 쓰지 않아서",
+          ],
+          answer: 1,
+          expl: "서로 다른 label로 이질적 정보를 한 그래프에 담고 어떤 vertex든 연결할 수 있어 진화·확장에 유연하다.",
+        },
+        {
+          type: "ox",
+          q: "모든 애플리케이션에 항상 최적인 단일 data model이 존재한다.",
+          answer: false,
+          expl: "만능 단일 모델은 없다. 데이터의 관계 구조에 맞는 모델을 골라야 한다.",
+        },
+        {
+          type: "ox",
+          q: "document model은 many-to-many 관계와 join을 relational model보다 잘 처리한다.",
+          answer: false,
+          expl: "many-to-many·join은 relational model이 더 잘 다룬다. document는 약하다.",
+        },
+        {
+          type: "ox",
+          q: '"schemaless"라고 불리는 document DB도 사실은 암묵적 스키마(schema-on-read)를 가진다.',
+          answer: true,
+          expl: "schemaless라 불려도 application이 읽을 때 구조를 가정하므로 암묵적 schema(schema-on-read)가 있다.",
+        },
+        {
+          type: "ox",
+          q: "관계형 DB와 document DB는 서로의 기능을 흡수하며 수렴(convergence)하는 추세다.",
+          answer: true,
+          expl: "관계형은 JSON 지원(PostgreSQL 9.3, MySQL 5.7, IBM DB2 10.5)을, document DB는 join 유사 기능을 추가하며 수렴 중이다.",
+        },
+        {
+          type: "short",
+          q: "declarative 질의에서 실행 방법(어떤 인덱스/access path를 쓸지)을 자동으로 결정해 주는 DB 내부 모듈의 이름은?",
+          answers: [
+            "query optimizer",
+            "쿼리 옵티마이저",
+            "optimizer",
+            "질의 최적화기",
+          ],
+          expl: "Query optimizer — declarative 질의의 실행 계획(access path/인덱스 선택)을 자동 결정한다.",
+        },
+        {
+          type: "short",
+          q: "한 시스템 안에서 관계형·document·graph 등 여러 종류의 저장소를 용도에 맞게 함께 쓰는 접근을 무엇이라 부르는가?",
+          answers: [
+            "polyglot persistence",
+            "폴리글랏 퍼시스턴스",
+            "폴리글롯 퍼시스턴스",
+          ],
+          expl: "Polyglot persistence — 용도에 맞게 여러 종류의 데이터스토어를 함께 사용하는 접근.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>

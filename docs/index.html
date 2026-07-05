@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Designing Data-Intensive Applications</h1>
+      <p class="subtitle">
+        Martin Kleppmann의 DDIA를 챕터별로 정리한 학습 노트 — 상세 설명 · 심층
+        개념 · 쉬운 비유 · 인터랙티브 퀴즈(챕터당 20문제)
+      </p>
+
+      <div class="callout">
+        설명은 한국어, 핵심 기술 용어는 영어 원문 그대로 유지합니다
+        (replication, partitioning, consensus …). 각 챕터 끝의 퀴즈는
+        클릭/입력으로 바로 채점됩니다.
+      </div>
+
+      <p class="part-label">Part I — Foundations of Data Systems</p>
+      <ul class="chapter-list">
+        <li>
+          <a href="ch01.html"
+            >Ch1. Reliable, Scalable, and Maintainable Applications</a
+          >
+          <div class="desc">
+            Reliability · fault vs failure · load parameter · percentile/tail
+            latency · maintainability 3원칙
+          </div>
+        </li>
+        <li>
+          <a href="ch02.html">Ch2. Data Models and Query Languages</a>
+          <div class="desc">
+            relational vs document vs graph · schema-on-read/write · declarative
+            query · Cypher/SPARQL/Datalog
+          </div>
+        </li>
+        <li>
+          <a href="ch03.html">Ch3. Storage and Retrieval</a>
+          <div class="desc">
+            LSM-tree vs B-tree · index trade-off · OLTP vs OLAP ·
+            column-oriented storage
+          </div>
+        </li>
+        <li>
+          <a href="ch04.html">Ch4. Encoding and Evolution</a>
+          <div class="desc">
+            backward/forward compatibility · Thrift/Protobuf/Avro · REST/RPC ·
+            message broker
+          </div>
+        </li>
+      </ul>
+
+      <p class="part-label">Part II — Distributed Data</p>
+      <ul class="chapter-list">
+        <li>
+          <a href="ch05.html">Ch5. Replication</a>
+          <div class="desc">
+            single-leader/multi-leader/leaderless · replication lag ·
+            read-your-writes · quorum · version vector
+          </div>
+        </li>
+        <li>
+          <a href="ch06.html">Ch6. Partitioning</a>
+          <div class="desc">
+            key-range vs hash · hot spot · local/global secondary index ·
+            rebalancing · request routing
+          </div>
+        </li>
+        <li class="pending">Ch7. Transactions</li>
+        <li class="pending">Ch8. The Trouble with Distributed Systems</li>
+        <li class="pending">Ch9. Consistency and Consensus</li>
+      </ul>
+
+      <p class="part-label">Part III — Derived Data (작성 예정)</p>
+      <ul class="chapter-list">
+        <li class="pending">Ch10. Batch Processing</li>
+        <li class="pending">Ch11. Stream Processing</li>
+        <li class="pending">Ch12. The Future of Data Systems</li>
+      </ul>
+    </main>
+  </body>
+</html>

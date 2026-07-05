@@ -1,0 +1,815 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch4. Encoding and Evolution — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html" class="active">Ch4</a>
+    <a href="ch05.html">Ch5</a>
+    <a href="ch06.html">Ch6</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch4. Encoding and Evolution</h1>
+      <p class="subtitle">
+        코드와 데이터는 동시에 바뀌지 않는다 — backward/forward compatibility를
+        지키는 encoding 포맷과, 데이터가 흐르는 세 가지 경로(DB, service call,
+        message)
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        애플리케이션은 시간이 지나면 반드시 바뀐다. 기능이 추가되고 데이터
+        구조(schema)가 변한다. 문제의 핵심은
+        <strong>코드와 데이터가 한순간에 동시에 바뀌지 않는다</strong>는 점이다.
+      </p>
+      <ul>
+        <li>
+          <strong>서버</strong>: 보통 <strong>rolling upgrade</strong>(노드를 몇
+          개씩 순차 교체하는 무중단 배포)로 배포한다. 그동안 잠깐
+          <strong>신버전과 구버전 코드가 공존</strong>한다.
+        </li>
+        <li>
+          <strong>클라이언트</strong>: 사용자가 앱 업데이트를 안 할 수도 있다.
+          구버전 클라이언트가 한동안 남는다.
+        </li>
+      </ul>
+      <p>그래서 데이터를 주고받을 때 두 방향의 호환성이 필요하다.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>호환성</th>
+            <th>정의</th>
+            <th>난이도</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Backward compatibility (하위 호환)</strong></td>
+            <td>
+              <strong>새 코드</strong>가 <strong>옛 코드가 쓴 데이터</strong>를
+              읽을 수 있다
+            </td>
+            <td>보통 어렵지 않음 — 새 코드는 옛 포맷을 이미 알고 있다</td>
+          </tr>
+          <tr>
+            <td><strong>Forward compatibility (상위 호환)</strong></td>
+            <td>
+              <strong>옛 코드</strong>가 <strong>새 코드가 쓴 데이터</strong>를
+              읽을 수 있다
+            </td>
+            <td>
+              더 어렵다 — 옛 코드는 미래의 추가분을 모르므로, 모르는 부분을
+              무시할 수 있어야 한다
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>심층 설명</strong> — forward compatibility가 더 어려운 이유는
+        "지식의 비대칭" 때문이다. backward compat에서는 새 코드가 과거를 알고
+        있으므로 옛 포맷 처리 로직을 명시적으로 넣을 수 있다. 반면 forward
+        compat에서는 옛 코드가 미래를 예측할 수 없으므로, 포맷 자체가 "모르는
+        데이터를 만나면 안전하게 건너뛰고, 필요하면 보존한다"는 규칙을
+        <em>미리</em> 내장해야 한다. 실무적 함의: 새 field를 추가하기 전에, 이미
+        배포된 구버전 코드가 그 field를 어떻게 다룰지가 결정되어 있어야 한다는
+        뜻이다. 흔한 오해는 "서버만 먼저 올리면 forward compat이 필요 없다"는
+        것인데, rolling upgrade 중이나 구버전 클라이언트가 남아 있는 한 옛
+        코드는 언제든 새 데이터를 만날 수 있다.
+      </div>
+      <p>
+        이 챕터는 (1) 데이터를 바이트로 바꾸는
+        <strong>encoding 포맷</strong>들과 그것들이 schema 변화를 얼마나 잘
+        견디는지, (2) 데이터가 프로세스 사이를 흐르는
+        <strong>세 가지 방식</strong>(database, service call, message)을 다룬다.
+      </p>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>Encoding이란? (Serialization)</h3>
+      <p>데이터는 두 가지 표현 사이를 오간다.</p>
+      <ul>
+        <li>
+          <strong>In-memory 표현</strong>: 객체, struct, list, array, hash table
+          등. 포인터로 연결되어 CPU가 다루기 좋다.
+        </li>
+        <li>
+          <strong>Byte sequence 표현</strong>: 파일 저장이나 네트워크 전송을
+          위한 연속된 바이트. 자기완결적이며 포인터가 없다.
+        </li>
+      </ul>
+      <table>
+        <thead>
+          <tr>
+            <th>방향</th>
+            <th>이름</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>in-memory → bytes</td>
+            <td><strong>Encoding</strong> = serialization = marshalling</td>
+          </tr>
+          <tr>
+            <td>bytes → in-memory</td>
+            <td>
+              <strong>Decoding</strong> = parsing = deserialization =
+              unmarshalling
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>언어 전용 포맷의 함정</h3>
+      <p>
+        Java <code>Serializable</code>, Python <code>pickle</code>, Ruby
+        <code>Marshal</code> 등 언어 내장 직렬화는 편하지만 위험하다.
+      </p>
+      <ul>
+        <li><strong>특정 언어에 묶인다</strong> — 다른 언어가 읽기 어렵다.</li>
+        <li>
+          <strong>보안 문제</strong> — 디코딩 시 임의 클래스를 인스턴스화할 수
+          있어 공격에 악용된다.
+        </li>
+        <li>
+          <strong>버전 관리(호환성)가 빈약</strong>하고,
+          <strong>효율도 나쁜</strong> 경우가 많다.
+        </li>
+      </ul>
+      <p>→ <strong>일시적인 용도 외에는 쓰지 말 것.</strong></p>
+
+      <h3>JSON, XML, CSV (텍스트 포맷)</h3>
+      <p>널리 쓰이고 사람이 읽을 수 있다. 하지만 약점이 있다.</p>
+      <ul>
+        <li>
+          <strong>숫자 모호성</strong>: 정수/부동소수 구분이 불명확하다. 특히
+          JSON은 2<sup>53</sup>보다 큰 정수에서 정밀도가 깨진다 (예: Twitter의
+          tweet ID가 깨져서 문자열로도 함께 보내야 했던 사례).
+        </li>
+        <li>
+          <strong>Binary string 미지원</strong>: 바이너리 데이터를 직접 못 담아
+          <strong>Base64</strong>로 우회한다 (크기 약 33% 증가).
+        </li>
+        <li>
+          <strong>Schema 지원이 선택적</strong>: XML Schema / JSON Schema는
+          강력하지만 복잡하고 잘 안 쓴다. CSV는 schema가 아예 없어 의미가
+          모호하다.
+        </li>
+      </ul>
+      <p>
+        → 결함은 있어도 <strong>조직 간 데이터 교환</strong> 같은 용도엔 충분히
+        좋다("good enough").
+      </p>
+
+      <h3>Binary encoding — JSON의 binary 변형</h3>
+      <p>
+        조직 <em>내부</em>에서만 쓴다면 더 작고 빠른 binary 포맷이 낫다. JSON의
+        binary 변형으로 <strong>MessagePack, BSON</strong> 등이 있지만, 이들은
+        여전히 <strong>field 이름을 데이터에 포함</strong>하기 때문에 절감
+        효과가 제한적이다.
+      </p>
+
+      <h3>Thrift와 Protocol Buffers (schema 기반)</h3>
+      <p>
+        둘 다 <strong>schema(IDL)를 먼저 정의</strong>하고 코드 생성을 한다.
+      </p>
+      <ul>
+        <li>
+          핵심 아이디어: 각 field에 <strong>tag number(field tag)</strong>와
+          타입을 부여한다.
+          <strong
+            >field 이름은 인코딩된 데이터에 들어가지 않고 tag 숫자만</strong
+          >
+          들어간다 → 매우 compact.
+        </li>
+        <li>
+          Thrift에는 BinaryProtocol과 <strong>CompactProtocol</strong>(가변 길이
+          정수, zigzag 인코딩으로 더 작게)이 있다. Protobuf도 유사한 방식이다.
+        </li>
+      </ul>
+      <p><strong>Schema evolution 규칙 — tag가 호환성의 열쇠:</strong></p>
+      <table>
+        <thead>
+          <tr>
+            <th>변경</th>
+            <th>규칙</th>
+            <th>호환성 근거</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Field 추가</strong></td>
+            <td>
+              새 tag number를 부여. 추가 field는
+              <strong>optional이거나 default 값</strong>이 있어야 함 (나중에
+              추가한 field를 <code>required</code>로 만들 수 없음)
+            </td>
+            <td>
+              옛 코드는 모르는 tag를 <strong>무시</strong> → forward compat. 새
+              코드는 없는 field를 optional/default로 처리 → backward compat
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Field 삭제</strong></td>
+            <td>
+              optional field만 삭제 가능.
+              <strong>삭제한 tag number는 절대 재사용 금지</strong>
+            </td>
+            <td>재사용하면 옛 데이터와 충돌</td>
+          </tr>
+          <tr>
+            <td><strong>타입 변경</strong></td>
+            <td>가능은 하나 주의</td>
+            <td>정밀도 손실 / truncation 위험</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>심층 설명</strong> — tag number 재사용이 절대 금지인 이유는,
+        인코딩된 데이터에 남는 정보가 오직 "tag 숫자 + 타입 + 값"뿐이기
+        때문이다. 예컨대 tag 3이 과거 <code>phone_number</code>(string)였다가
+        삭제되고, 나중에 tag 3을 <code>score</code>(int)로 재사용하면, 디스크나
+        로그에 남아 있는 옛 레코드의 tag 3 데이터를 새 코드가
+        <code>score</code>로 잘못 해석한다 — 파싱 에러면 그나마 다행이고, 타입이
+        우연히 맞으면 <em>조용히 잘못된 값</em>이 들어간다. 데이터는 코드보다
+        오래 살기 때문에(data outlives code) "그 tag를 쓴 데이터가 이제 없다"고
+        확신할 방법이 사실상 없다. 실무에서는 Protobuf의
+        <code>reserved</code> 키워드로 삭제한 tag를 영구 봉인하는 것이 관례다.
+      </div>
+
+      <h3>Avro</h3>
+      <p>
+        Thrift/Protobuf와 달리 <strong>tag number가 없다.</strong> 대신 두 개의
+        schema를 쓴다.
+      </p>
+      <ul>
+        <li>
+          <strong>Writer's schema</strong>(데이터를 쓸 때의 schema) +
+          <strong>reader's schema</strong>(읽을 때의 schema).
+        </li>
+        <li>
+          <strong>Schema resolution</strong>: 읽을 때 두 schema를 비교해
+          <strong>field 이름으로 매칭</strong>한다. 둘이 똑같을 필요는 없고
+          <strong>호환되기만</strong> 하면 된다.
+        </li>
+        <li>
+          데이터에 field 이름도 tag도 없어 <strong>가장 compact</strong>하다
+          (오로지 schema에 의존).
+        </li>
+      </ul>
+      <p><strong>Reader는 writer's schema를 어떻게 아는가?</strong> (상황별)</p>
+      <table>
+        <thead>
+          <tr>
+            <th>상황</th>
+            <th>방법</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>큰 파일에 많은 레코드 (예: Hadoop)</td>
+            <td>
+              파일 맨 앞에 writer's schema를 한 번 넣는다 (Avro object container
+              file)
+            </td>
+          </tr>
+          <tr>
+            <td>DB에 레코드를 개별 기록</td>
+            <td>
+              레코드마다 schema <strong>버전 번호</strong>를 붙이고, 버전→schema
+              매핑은 <strong>schema registry</strong>에 둔다
+            </td>
+          </tr>
+          <tr>
+            <td>네트워크 전송</td>
+            <td>
+              연결 수립 시 schema를 <strong>협상(negotiate)</strong> (Avro RPC)
+            </td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        <strong>Avro의 강점 — 동적 생성 schema에 친화적:</strong> tag number를
+        사람이 일일이 배정할 필요가 없어,
+        <strong>DB schema에서 Avro schema를 자동 생성</strong>하기 좋다 (예:
+        DB를 통째로 파일로 덤프). 코드 생성도 선택 사항이라 동적 타입 언어에 잘
+        맞는다.
+      </p>
+      <div class="callout">
+        <strong>심층 설명</strong> — Avro의 "tag 없는" 인코딩이 성립하는
+        메커니즘: 인코딩된 바이트에는 field 식별자가 전혀 없고 값들만 schema에
+        정의된 순서대로 이어져 있다. 따라서 디코딩하려면 그 데이터를 쓴 시점의
+        writer's schema를 <em>바이트 단위로 정확히</em> 알아야 하고, reader's
+        schema와 다르면 schema resolution이 이름 기준으로 번역해 준다 —
+        writer에만 있는 field는 건너뛰고, reader에만 있는 field는 default 값으로
+        채운다. 실무적 함의: writer's schema를 전달하는 채널(container file
+        헤더, schema registry, 협상)이 시스템 설계의 필수 요소가 된다. 흔한
+        오해는 "schema가 없어도 되는 포맷"이라는 것 — 정반대로, Avro는 schema에
+        <em>가장 강하게</em> 의존하는 포맷이며, 그 대가로 최고의 compact함과
+        동적 schema 생성 친화성을 얻는다.
+      </div>
+
+      <h3>Schema 기반 binary 인코딩의 장점</h3>
+      <p>JSON/XML 대비:</p>
+      <ul>
+        <li>field 이름을 빼서 <strong>더 compact</strong>하다.</li>
+        <li>schema 자체가 <strong>항상 최신인 문서</strong> 역할을 한다.</li>
+        <li>
+          배포 전에 schema 호환성을 <strong>자동 검사</strong>할 수 있다 (특히
+          schema registry).
+        </li>
+        <li>코드 생성 → <strong>컴파일 타임 타입 체크</strong>.</li>
+      </ul>
+
+      <h3>Modes of Dataflow ① — 데이터베이스를 통해</h3>
+      <p>한 프로세스가 DB에 쓰고, 다른(또는 나중의 같은) 프로세스가 읽는다.</p>
+      <ul>
+        <li>
+          <strong>Backward compat</strong>은 당연히 필요하다 (새 코드가 옛
+          데이터를 읽는다).
+        </li>
+        <li>
+          <strong>Forward compat</strong>도 필요하다: rolling upgrade 중엔 옛
+          코드가 새 코드가 쓴 데이터를 읽을 수 있다.
+        </li>
+        <li>
+          <strong>함정 — 모르는 field 보존</strong>: 옛 코드가 새 field가 포함된
+          레코드를 읽어서 갱신·저장할 때, 자기가 모르는 field를
+          <strong>버리면 안 된다</strong>. 모르는 field를 유지한 채로 다시 써야
+          한다.
+        </li>
+        <li>
+          <strong>데이터는 코드보다 오래 산다 (data outlives code)</strong>: 옛
+          데이터를 통째로 마이그레이션하는 건 비싸므로, schema evolution 덕분에
+          옛 포맷 데이터를 그대로 둘 수 있다.
+        </li>
+      </ul>
+
+      <h3>Modes of Dataflow ② — 서비스 호출을 통해 (REST와 RPC)</h3>
+      <p>
+        클라이언트–서버 구조. microservice/SOA에서는 서비스끼리 서로 호출한다.
+      </p>
+      <ul>
+        <li>
+          <strong>REST</strong>: HTTP 위의 설계 철학 (resource, URL, HTTP 동사
+          활용). 단순하고 널리 쓰인다.
+        </li>
+        <li>
+          <strong>SOAP</strong>: XML 기반 (WSDL 등). 복잡하고 요즘은 선호도가
+          낮다.
+        </li>
+        <li>
+          <strong>RPC (Remote Procedure Call)</strong>: 네트워크 호출을
+          <strong>로컬 함수 호출처럼</strong> 보이게 하려는 시도. 하지만 이
+          추상화는 새는 추상화(leaky abstraction)다:
+          <ul>
+            <li>
+              네트워크는 <strong>불안정</strong>하다 — timeout, 실패 가능.
+            </li>
+            <li><strong>지연(latency)</strong>이 있고 변동한다.</li>
+            <li>
+              <strong>재시도 시 idempotence</strong> 문제가 있다 (같은 요청이 두
+              번 처리될 수 있음).
+            </li>
+            <li>큰 인자 전달과 언어 간 타입 변환이 까다롭다.</li>
+          </ul>
+          → <strong>RPC ≠ 로컬 호출</strong>.
+        </li>
+        <li>
+          현대 RPC 프레임워크: <strong>gRPC</strong>(Protobuf), Finagle(Thrift),
+          Rest.li(JSON/HTTP). future·stream·service discovery를 지원한다.
+        </li>
+        <li>
+          <strong>호환성</strong>: 보통
+          <strong>서버를 먼저 업그레이드</strong>하므로, 요청에는 backward
+          compat(새 서버가 옛 클라이언트의 요청을 읽음), 응답에는 forward
+          compat(옛 클라이언트가 새 서버의 응답을 읽음)이 필요하다. API 버전
+          관리로 다룬다.
+        </li>
+      </ul>
+
+      <h3>Modes of Dataflow ③ — 비동기 메시지 전달을 통해</h3>
+      <p>
+        <strong>Message broker / message queue</strong>를 거친다. RPC(저지연)와
+        DB(durable)의 중간 성격이다. 송신자가 broker의
+        <strong>queue/topic</strong>에 메시지를 보내면, broker가 consumer에게
+        전달한다.
+      </p>
+      <ul>
+        <li>
+          수신자가 죽어도 <strong>버퍼링</strong>해 두었다가 재전달 → 안정성
+          향상.
+        </li>
+        <li>
+          송신자가 수신자의 IP/위치를 몰라도 됨 → <strong>decoupling</strong>.
+        </li>
+        <li>한 메시지를 <strong>여러 수신자</strong>에게 전달 가능.</li>
+        <li>송신자와 수신자가 서로 독립적으로 배포·확장 가능.</li>
+      </ul>
+      <p>
+        Broker 예: <strong>RabbitMQ, ActiveMQ, Kafka</strong> 등. 메시지는 결국
+        바이트 + 메타데이터이므로,
+        <strong
+          >encoding의 forward/backward compat이 있으면 publisher와 consumer를
+          독립적으로 업데이트</strong
+        >할 수 있다.
+      </p>
+      <p>
+        <strong>Distributed actor framework</strong>: actor model(상태를 가진
+        actor들이 메시지로만 소통 — thread/lock 없이 동시성 처리)을 여러 노드로
+        확장한 것. <strong>Location transparency</strong>(같은 머신이든 네트워크
+        너머든 동일하게 메시지 전달)가 핵심 성질이다. 예:
+        <strong>Akka, Orleans, Erlang OTP</strong>. rolling upgrade 시에는
+        여기서도 메시지 encoding 호환성이 필요하다.
+      </p>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Backward vs Forward compatibility — Word 문서</h3>
+        <p>
+          새 Word로 옛 <code>.doc</code>을 여는 건 backward compat(보통 잘
+          된다). 옛 Word로 새 기능이 든 문서를 여는 게 forward compat — 옛
+          Word는 모르는 새 기능을 <strong>무시하고</strong> 나머지는 보여줄 수
+          있어야 한다. 후자가 더 어렵다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Field tag — 번호표 붙은 서랍</h3>
+        <p>
+          옷장 서랍에 "이름표" 대신 <strong>번호표(1번, 2번…)</strong>를 붙이는
+          것. 데이터엔 번호만 적고, 무엇이 들었는지는 schema(번호↔의미 표)를
+          보면 안다. 이름을 매번 안 적으니 짐이 가볍다. 단,
+          <strong
+            >1번 서랍을 비웠다고 나중에 1번을 다른 용도로 재사용하면</strong
+          >
+          옛 기록과 꼬인다 (= tag 재사용 금지).
+        </p>
+      </div>
+      <div class="card">
+        <h3>모르는 field 무시 — forward compat의 태도</h3>
+        <p>
+          옛 코드가 새 데이터를 읽을 때, 처음 보는 항목은 "이건 내가 모르는 거니
+          건드리지 말고 그대로 두자"라고 처리한다. 그래야 신·구 버전이 공존할 수
+          있다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>모르는 field 보존 — DB dataflow의 함정</h3>
+        <p>
+          옛 버전 앱이 사용자 프로필을 수정해 저장할 때, 신버전이 추가한 "취미"
+          항목을 모른다고 지워버리면 안 된다 — 모른 채로 같이 보존해서 다시 써야
+          한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>RPC ≠ 로컬 호출 — 옆자리 대화 vs 국제 우편</h3>
+        <p>
+          옆자리 동료에게 말 거는 것(로컬 함수)과, 외국에 있는 사람에게 편지를
+          보내는 것(RPC)은 다르다. 편지는 분실·지연될 수 있고, 같은 편지를 두 번
+          보내면 상대가 두 번 처리할 수도 있다(idempotence 문제).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Message broker — 우체국</h3>
+        <p>
+          보내는 사람은 받는 사람이 지금 집에 있는지 몰라도 된다. 우체국이
+          보관했다가 전달하고, 같은 안내문을 여러 집에 돌릴 수도 있다.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Encoding / Serialization</strong></td>
+            <td>in-memory 표현을 byte sequence로 변환</td>
+          </tr>
+          <tr>
+            <td><strong>Decoding / Deserialization</strong></td>
+            <td>byte sequence를 in-memory 표현으로 변환</td>
+          </tr>
+          <tr>
+            <td><strong>Backward compatibility</strong></td>
+            <td>새 코드가 옛 코드가 쓴 데이터를 읽을 수 있음</td>
+          </tr>
+          <tr>
+            <td><strong>Forward compatibility</strong></td>
+            <td>옛 코드가 새 코드가 쓴 데이터를 읽을 수 있음</td>
+          </tr>
+          <tr>
+            <td><strong>Rolling upgrade</strong></td>
+            <td>노드를 순차 교체하는 무중단 배포 (신·구 버전 공존)</td>
+          </tr>
+          <tr>
+            <td><strong>Field tag</strong></td>
+            <td>
+              Thrift/Protobuf에서 field를 식별하는 숫자 (이름 대신 데이터에
+              저장)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Thrift / Protocol Buffers</strong></td>
+            <td>schema(IDL) + tag number 기반 binary 인코딩</td>
+          </tr>
+          <tr>
+            <td><strong>Avro</strong></td>
+            <td>tag 없이 writer/reader schema로 동작하는 binary 인코딩</td>
+          </tr>
+          <tr>
+            <td><strong>Writer's / Reader's schema</strong></td>
+            <td>데이터를 쓸 때 / 읽을 때 사용하는 schema</td>
+          </tr>
+          <tr>
+            <td><strong>Schema resolution</strong></td>
+            <td>reader가 두 schema를 비교해 field를 이름으로 매칭</td>
+          </tr>
+          <tr>
+            <td><strong>Schema registry</strong></td>
+            <td>schema 버전과 정의를 보관·조회하는 저장소</td>
+          </tr>
+          <tr>
+            <td><strong>Base64</strong></td>
+            <td>바이너리를 텍스트로 담기 위한 인코딩 (크기 약 33%↑)</td>
+          </tr>
+          <tr>
+            <td><strong>REST</strong></td>
+            <td>HTTP 위의 resource 중심 API 설계 철학</td>
+          </tr>
+          <tr>
+            <td><strong>RPC</strong></td>
+            <td>네트워크 호출을 로컬 함수처럼 보이게 하는 방식 (gRPC 등)</td>
+          </tr>
+          <tr>
+            <td><strong>Message broker</strong></td>
+            <td>메시지를 중계·버퍼링하는 미들웨어 (Kafka, RabbitMQ)</td>
+          </tr>
+          <tr>
+            <td><strong>Actor model</strong></td>
+            <td>상태를 가진 actor들이 메시지로만 통신하는 동시성 모델</td>
+          </tr>
+          <tr>
+            <td><strong>Location transparency</strong></td>
+            <td>대상이 로컬이든 원격이든 동일하게 메시지를 보내는 성질</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        코드와 데이터는 동시에 바뀌지 않으므로,
+        <strong>backward/forward compatibility</strong>를 지키는 encoding(특히
+        schema 기반의 Thrift·Protobuf·Avro)을 골라야 rolling upgrade가 가능하며,
+        데이터는 DB·service call(REST/RPC)·async message라는 세 경로로 흐른다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch03.html">← Ch3. Storage</a><a href="index.html">목차 →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: '"backward compatibility"의 정의로 옳은 것은?',
+          options: [
+            "옛 코드가 새 코드가 쓴 데이터를 읽을 수 있다",
+            "새 코드가 옛 코드가 쓴 데이터를 읽을 수 있다",
+            "코드가 항상 동시에 바뀐다",
+            "데이터는 절대 바뀌지 않는다",
+          ],
+          answer: 1,
+          expl: "backward compat = 새 코드가 옛 데이터를 읽음. (첫 번째 선택지는 forward compat.)",
+        },
+        {
+          type: "mcq",
+          q: '"forward compatibility"가 backward보다 더 어려운 이유는?',
+          options: [
+            "옛 코드는 미래에 추가될 부분을 모르므로 모르는 데이터를 무시할 수 있어야 해서",
+            "새 코드가 옛 포맷을 몰라서",
+            "데이터가 항상 작아서",
+            "JSON을 쓸 수 없어서",
+          ],
+          answer: 0,
+          expl: "옛 코드는 미래의 추가분을 모르므로, 모르는 field를 무시할 수 있어야 forward compat이 된다.",
+        },
+        {
+          type: "mcq",
+          q: "언어 전용 직렬화(Java Serializable, pickle 등)의 문제로 틀린 것은?",
+          options: [
+            "특정 언어에 묶인다",
+            "디코딩 시 보안 위험이 있다",
+            "버전 호환성이 빈약하다",
+            "항상 가장 compact하고 빠르다",
+          ],
+          answer: 3,
+          expl: "언어 전용 직렬화는 오히려 효율이 나쁜 경우가 많다. 나머지는 모두 실제 문제점.",
+        },
+        {
+          type: "mcq",
+          q: "JSON의 숫자 인코딩 약점으로 옳은 것은?",
+          options: [
+            "음수를 표현할 수 없다",
+            "2^53보다 큰 정수에서 정밀도가 깨질 수 있다",
+            "정수만 표현할 수 있다",
+            "숫자를 전혀 담을 수 없다",
+          ],
+          answer: 1,
+          expl: "JSON은 2^53 초과 정수에서 정밀도가 깨진다 (예: tweet ID를 문자열로도 보낸 사례).",
+        },
+        {
+          type: "mcq",
+          q: "JSON/XML에서 바이너리 데이터를 담을 때 흔한 우회 방법은?",
+          options: [
+            "그냥 바이너리를 직접 넣는다",
+            "Base64로 인코딩한다(크기 약 33% 증가)",
+            "압축만 하면 된다",
+            "담을 수 없으므로 포기한다",
+          ],
+          answer: 1,
+          expl: "Base64로 인코딩해 텍스트에 담으며, 크기가 약 33% 늘어난다.",
+        },
+        {
+          type: "mcq",
+          q: "Thrift/Protobuf에서 인코딩된 데이터에 실제로 저장되는 것은?",
+          options: [
+            "field 이름",
+            "field tag(숫자)와 값",
+            "전체 schema",
+            "주석",
+          ],
+          answer: 1,
+          expl: "field 이름은 빠지고 tag number와 값만 저장된다 → compact. 의미는 schema가 보유.",
+        },
+        {
+          type: "mcq",
+          q: "Thrift/Protobuf에서 새 field를 추가할 때 backward compat을 위해 필요한 것은?",
+          options: [
+            "새 field를 required로 지정",
+            "새 field를 optional로 두거나 default 값을 부여",
+            "기존 tag number 재사용",
+            "모든 옛 데이터 마이그레이션",
+          ],
+          answer: 1,
+          expl: "나중에 추가한 field는 optional이거나 default가 있어야 새 코드가 옛 데이터를 읽을 수 있다. (required로 만들 수 없음.)",
+        },
+        {
+          type: "mcq",
+          q: "Thrift/Protobuf에서 절대 하면 안 되는 것은?",
+          options: [
+            "optional field 추가",
+            "삭제한 field의 tag number를 다른 field에 재사용",
+            "새 tag number 부여",
+            "CompactProtocol 사용",
+          ],
+          answer: 1,
+          expl: "삭제한 tag number 재사용은 옛 데이터와 충돌하므로 절대 금지.",
+        },
+        {
+          type: "mcq",
+          q: "Avro가 Thrift/Protobuf와 다른 핵심 차이는?",
+          options: [
+            "schema가 전혀 필요 없다",
+            "field tag number 없이 writer/reader schema를 이름으로 매칭한다",
+            "텍스트 포맷이다",
+            "항상 코드 생성을 강제한다",
+          ],
+          answer: 1,
+          expl: "Avro는 tag 없이 writer/reader schema를 field 이름으로 매칭(schema resolution)한다.",
+        },
+        {
+          type: "mcq",
+          q: "Avro에서 reader가 writer's schema를 아는 방법이 아닌 것은?",
+          options: [
+            "큰 파일 맨 앞에 writer schema 포함",
+            "레코드마다 버전 번호 + schema registry",
+            "연결 수립 시 schema 협상",
+            "field tag number로부터 자동 추론",
+          ],
+          answer: 3,
+          expl: "Avro엔 tag number가 없다. (나머지 셋이 실제로 writer schema를 전달하는 방법.)",
+        },
+        {
+          type: "mcq",
+          q: 'Avro가 "동적 생성 schema"에 특히 친화적인 이유는?',
+          options: [
+            "tag number를 사람이 일일이 배정할 필요가 없어 DB schema에서 자동 생성하기 쉽다",
+            "schema가 필요 없어서",
+            "JSON 기반이라서",
+            "항상 required field만 써서",
+          ],
+          answer: 0,
+          expl: "tag 배정이 불필요해 DB schema 등에서 Avro schema를 자동 생성하기 좋다.",
+        },
+        {
+          type: "mcq",
+          q: "DB를 통한 dataflow에서, 옛 코드가 새 field가 든 레코드를 갱신·저장할 때 지켜야 할 것은?",
+          options: [
+            "모르는 field는 삭제한다",
+            "모르는 field를 그대로 보존한 채 다시 쓴다",
+            "전체 레코드를 새 schema로 변환한다",
+            "저장을 거부한다",
+          ],
+          answer: 1,
+          expl: "모르는 field를 삭제하면 안 되고, 보존한 채 다시 써야 forward compat이 유지된다.",
+        },
+        {
+          type: "mcq",
+          q: '"data outlives code"가 schema evolution과 연결되는 의미는?',
+          options: [
+            "데이터를 매번 전부 마이그레이션해야 한다",
+            "옛 포맷 데이터를 마이그레이션 없이 그대로 둘 수 있게 해준다",
+            "코드가 데이터보다 오래 산다",
+            "데이터는 호환성이 필요 없다",
+          ],
+          answer: 1,
+          expl: "데이터가 코드보다 오래 살기에, schema evolution이 옛 데이터를 마이그레이션 없이 유지하게 해준다.",
+        },
+        {
+          type: "mcq",
+          q: 'RPC 추상화가 "로컬 함수 호출과 다르다"는 근거로 틀린 것은?',
+          options: [
+            "네트워크 호출은 실패/timeout이 가능하다",
+            "재시도 시 idempotence 문제가 생길 수 있다",
+            "지연(latency)이 변동한다",
+            "항상 즉시 성공하고 실패하지 않는다",
+          ],
+          answer: 3,
+          expl: 'RPC는 실패/지연/idempotence 문제가 있어 로컬 호출과 다르다. "항상 즉시 성공"은 틀림.',
+        },
+        {
+          type: "mcq",
+          q: "REST API 서비스에서 보통 서버를 먼저 업그레이드할 때 필요한 호환성 조합은?",
+          options: [
+            "요청은 forward, 응답은 backward",
+            "요청은 backward, 응답은 forward",
+            "둘 다 불필요",
+            "요청만 필요",
+          ],
+          answer: 1,
+          expl: "서버를 먼저 올리면, 옛 클라이언트의 요청을 받아야 하므로 요청에 backward, 응답에 forward compat이 필요.",
+        },
+        {
+          type: "mcq",
+          q: "message broker(메시지 큐) 방식의 장점이 아닌 것은?",
+          options: [
+            "수신자가 죽어도 버퍼링 후 재전달",
+            "송신자가 수신자의 위치를 몰라도 됨",
+            "한 메시지를 여러 수신자에게 전달",
+            "항상 RPC보다 낮은 지연을 보장",
+          ],
+          answer: 3,
+          expl: "broker는 durability·decoupling이 장점이지만, 지연은 RPC보다 클 수 있다(중간 성격).",
+        },
+        {
+          type: "mcq",
+          q: "actor model의 location transparency가 의미하는 것은?",
+          options: [
+            "actor는 항상 같은 머신에 있어야 한다",
+            "대상이 로컬이든 원격이든 동일하게 메시지를 보낸다",
+            "메시지를 암호화한다",
+            "thread와 lock을 직접 다룬다",
+          ],
+          answer: 1,
+          expl: "location transparency = 로컬/원격 구분 없이 동일하게 메시지를 보낸다.",
+        },
+        {
+          type: "ox",
+          q: "schema 기반 binary 인코딩(Avro/Protobuf)은 field 이름을 생략해 JSON보다 compact하다.",
+          answer: true,
+          expl: "field 이름을 schema로 빼내어 데이터가 더 compact해진다.",
+        },
+        {
+          type: "ox",
+          q: "rolling upgrade 중에는 신버전과 구버전 코드가 동시에 존재할 수 있다.",
+          answer: true,
+          expl: "rolling upgrade의 본질이 신·구 버전 공존이며, 그래서 호환성이 필요하다.",
+        },
+        {
+          type: "ox",
+          q: "message broker는 RPC와 달리 송신자와 수신자를 시간적으로 decoupling한다.",
+          answer: true,
+          expl: "broker는 메시지를 보관·재전달해 송신자와 수신자를 시간적으로 분리(decoupling)한다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>

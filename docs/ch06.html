@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch6. Partitioning — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html" class="active">Ch6</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch6. Partitioning</h1>
+      <p class="subtitle">
+        큰 데이터셋과 높은 부하를 여러 노드에 골고루 나누기 — key range vs hash,
+        local vs global index, rebalancing, 그리고 요청을 올바른 partition으로
+        보내는 routing
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        데이터셋이 너무 크거나 query 처리량이 너무 높으면 한 노드로는 감당할 수
+        없다. 해결책은 데이터를 <strong>partition</strong>(shard)으로 쪼개 여러
+        노드에 나누어 놓는 것 — <strong>scalability</strong>가 목적이다.
+      </p>
+      <ul>
+        <li>
+          각 데이터 조각(record, row, document)은
+          <strong>정확히 하나의 partition</strong>에 속한다.
+        </li>
+        <li>
+          큰 데이터셋을 여러 디스크에, query 부하를 여러 프로세서에 분산할 수
+          있다.
+        </li>
+        <li>
+          <strong>Partitioning은 보통 replication과 함께 쓰인다</strong>: 각
+          partition의 복사본을 여러 노드에 둔다. 한 노드는
+          <strong
+            >어떤 partition들의 leader이면서 동시에 다른 partition들의
+            follower</strong
+          >일 수 있다.
+        </li>
+      </ul>
+      <p>
+        핵심 목표는
+        <strong>데이터와 query 부하를 노드들에 골고루 분산</strong>하는 것이다.
+        분산이 불공평해서 일부 partition에 데이터·부하가 몰린 상태를
+        <strong>skew</strong>라 하고, 불균형하게 높은 부하를 받는 partition을
+        <strong>hot spot</strong>이라 한다.
+      </p>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>Key-value 데이터의 partitioning ① — key range 기준</h3>
+      <p>
+        각 partition에 <strong>연속된 key 구간(range)</strong>을 할당한다
+        (백과사전의 A–B권, C–D권처럼).
+      </p>
+      <ul>
+        <li>
+          key가 <strong>정렬된 상태로 유지</strong>되므로
+          <strong>range scan이 쉽다</strong> (예: Bigtable, HBase, RethinkDB,
+          MongoDB의 range 방식).
+        </li>
+        <li>
+          구간 경계는 데이터 분포에 맞춰 조정해야 한다 (알파벳 균등 분할이
+          아니라 데이터 양 균등 분할).
+        </li>
+        <li>
+          <strong>약점 — hot spot 위험</strong>: 특정 접근 패턴이 한 구간에 몰릴
+          수 있다. 예: <strong>timestamp를 key로 쓰는 sensor 데이터</strong>
+          — 오늘 쓰는 데이터가 전부 "오늘" partition에 몰려, 쓰기 부하가 한
+          partition에 집중된다.
+          <ul>
+            <li>
+              완화책: key 앞에 <strong>sensor 이름을 prefix</strong>로 붙여
+              (sensor별 → 시간순) 쓰기를 분산한다. 단, 특정 시간 범위의
+              <em>전체</em> sensor 조회는 sensor별로 여러 range query를 날려야
+              한다.
+            </li>
+          </ul>
+        </li>
+      </ul>
+
+      <h3>Key-value 데이터의 partitioning ② — key의 hash 기준</h3>
+      <p>
+        <strong>hash function</strong>으로 key를 숫자로 바꾸고, hash 값 구간을
+        partition에 할당한다.
+      </p>
+      <ul>
+        <li>
+          좋은 hash는 skew된 key도 <strong>균등하게 분산</strong>시킨다
+          (Cassandra의 MD5, MongoDB의 hashed sharding 등). 암호학적으로 강할
+          필요는 없다.
+        </li>
+        <li>
+          <strong>대가 — range query 효율 상실</strong>: 인접했던 key들이 hash
+          후 흩어지므로, range query는 모든 partition에 보내야 한다
+          (Riak·Couchbase·Voldemort는 primary key range query를 지원하지 않음).
+        </li>
+        <li>
+          참고: 이 방식은 <strong>consistent hashing</strong>이라 불리기도
+          하지만, 책은 이 용어가 (CDN 유래의 특정 기법을 가리켜) 혼란스러우니
+          <strong>hash partitioning</strong>이라 부르길 권한다.
+        </li>
+        <li>
+          <strong>Cassandra의 절충 — compound primary key</strong>: 여러 column
+          중 <strong>첫 column만 hash</strong>해서 partition을 정하고,
+          <strong>나머지 column들은 SSTable 안에서 정렬</strong>에 쓴다. → 첫
+          column을 고정하면 나머지 column에 대해 효율적인
+          <strong>range scan</strong>이 가능 (예:
+          <code>(user_id, update_timestamp)</code> — 한 사용자의 최근 게시물을
+          시간순으로 조회).
+        </li>
+      </ul>
+      <table>
+        <thead>
+          <tr>
+            <th>기준</th>
+            <th>Key range partitioning</th>
+            <th>Hash partitioning</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>정렬</td>
+            <td>key 정렬 유지</td>
+            <td>정렬 상실 (인접 key가 흩어짐)</td>
+          </tr>
+          <tr>
+            <td>range scan</td>
+            <td>효율적 (한/소수 partition)</td>
+            <td>모든 partition에 query 필요</td>
+          </tr>
+          <tr>
+            <td>부하 분산</td>
+            <td>접근 패턴에 따라 hot spot 위험</td>
+            <td>균등 분산에 유리</td>
+          </tr>
+          <tr>
+            <td>대표 시스템</td>
+            <td>Bigtable, HBase, RethinkDB</td>
+            <td>Cassandra, MongoDB(hashed), Riak, Voldemort</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>심층 설명</strong> — key range vs hash는 "정렬을 지키느냐,
+        분산을 지키느냐"의 trade-off다. key range는 데이터의
+        <em>의미적 인접성</em>을 물리적 인접성으로 보존하므로 range scan이 한
+        partition 안에서 끝나지만, 그 인접성 때문에 접근 패턴이 한 구간에
+        몰리면(예: timestamp key의 "오늘" 구간) 쓰기 hot spot이 생긴다. hash는
+        인접성을 일부러 파괴해서 부하를 확률적으로 고르게 만들지만, 그 대가로
+        range query가 전 partition scatter가 된다. 그래서 실전 시스템은 중간
+        지점을 찾는다 — Cassandra의 compound key는 "partition 간에는 hash로
+        분산, partition 안에서는 정렬 유지"라는 2단 구조로 두 세계를 절충한다.
+        핵심은 "어떤 축으로 몰리고, 어떤 축으로 훑는가"를 파악해 몰리는 축을
+        hash하고 훑는 축을 정렬에 남기는 것이다.
+      </div>
+
+      <h3>Skewed workload와 hot spot 완화</h3>
+      <p>
+        hash partitioning도
+        <strong>극단적으로 skew된 workload</strong>는 못 막는다 — 모두가 같은
+        key를 읽고 쓰면 (예: 팔로워 수백만 celebrity의 user ID에 이벤트가 폭주)
+        그 key의 partition이 hot spot이 된다.
+      </p>
+      <ul>
+        <li>
+          현재 대부분의 시스템은 이를
+          <strong>자동으로 보정하지 못한다</strong> →
+          <strong>application의 책임</strong>이다.
+        </li>
+        <li>
+          기법: 극소수의 hot key에만 <strong>random suffix</strong>(예: 두 자리
+          숫자 00~99)를 붙여 100개 key로 쪼개 여러 partition에 분산한다.
+          <ul>
+            <li>
+              대가: <strong>읽기는 100개 key를 전부 읽어 합쳐야</strong> 하고,
+              어떤 key를 쪼갰는지 추적하는 부가 관리가 필요하다. 그래서 소수의
+              hot key에만 적용해야 한다.
+            </li>
+          </ul>
+        </li>
+      </ul>
+
+      <h3>Partitioning과 secondary index ① — document 기반 (local index)</h3>
+      <ul>
+        <li>
+          각 partition이
+          <strong>자기 partition 안의 document만</strong> 대상으로 secondary
+          index를 유지한다 → <strong>local index</strong>. 쓰기는 해당
+          document가 있는 partition만 갱신하면 된다.
+        </li>
+        <li>
+          <strong>읽기의 대가 — scatter/gather</strong>: secondary index로
+          검색하려면 (원하는 값이 어느 partition에 있을지 모르므로)
+          <strong>모든 partition에 query를 보내고 결과를 합쳐야</strong> 한다.
+          병렬로 보내도 <strong>tail latency amplification</strong>(가장 느린
+          partition이 전체 응답을 좌우)에 취약하다.
+        </li>
+        <li>
+          그래도 널리 쓰인다: MongoDB, Riak, Cassandra, Elasticsearch,
+          SolrCloud, VoltDB 등.
+        </li>
+      </ul>
+
+      <h3>Partitioning과 secondary index ② — term 기반 (global index)</h3>
+      <ul>
+        <li>
+          모든 partition의 데이터를 아우르는 <strong>global index</strong>를
+          만들되, 이 index 자체도 한 노드에 두면 병목이므로
+          <strong>term(색인하는 값) 기준으로 partition</strong>한다. (예:
+          <code>color:red</code>는 index partition 0에,
+          <code>color:silver</code>는 partition 1에.)
+        </li>
+        <li>
+          term 자체로 나누면 range scan에 유리, term의 hash로 나누면 부하 분산에
+          유리.
+        </li>
+        <li>
+          <strong>읽기가 효율적</strong>: 원하는 term이 있는
+          <strong>index partition 하나만</strong> 조회하면 된다 (scatter/gather
+          불필요).
+        </li>
+        <li>
+          <strong>쓰기의 대가</strong>: 한 document 쓰기가
+          <strong>여러 index partition</strong>을 건드릴 수 있다 → 동기 갱신에는
+          분산 트랜잭션이 필요한데 대부분 지원하지 않아, 실무에서는
+          <strong>global index를 비동기(asynchronous)로 갱신</strong>한다 (쓰기
+          직후 index에 바로 반영되지 않을 수 있음 — 예: Amazon DynamoDB의 GSI).
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — local vs global index는 "비용을 쓰기에
+        내느냐, 읽기에 내느냐"의 선택이다. local index는 쓰기가 document의
+        partition 안에서 완결되므로 빠르고 트랜잭션적으로 단순하지만, 읽기가 전
+        partition scatter/gather가 되어 partition 수가 늘수록 검색 비용과 tail
+        latency가 함께 커진다. global index는 그 비용을 쓰기 쪽으로 옮긴다 — 한
+        document의 term들이 여러 index partition에 흩어져 있으니 쓰기 한 건이
+        다중 partition 갱신이 되고, 이를 동기로 하려면 분산 트랜잭션이 필요하다.
+        대부분의 시스템이 이를 포기하고 비동기 갱신을 택하므로, global index는
+        "방금 쓴 데이터가 검색에 안 보일 수 있다"는 일관성 지연을 안고 간다. 즉
+        read-heavy 검색이면 global, write-heavy이고 검색 fan-out을 감당할 수
+        있으면 local이 자연스러운 선택이다.
+      </div>
+
+      <h3>Rebalancing — 하면 안 되는 방법: hash mod N</h3>
+      <p>
+        시간이 지나면 query 증가·데이터 증가·노드 장애로 partition을 노드 간에
+        옮겨야 한다 = <strong>rebalancing</strong>. 요구사항: 부하가 공평해질
+        것, rebalancing 중에도 서비스가 계속될 것,
+        <strong>필요 이상으로 데이터를 옮기지 말 것</strong>.
+      </p>
+      <blockquote>
+        <code>hash(key) mod N</code>은 나쁘다 — 노드 수 N이 바뀌면
+        <strong>대부분의 key가 다른 노드로 재배치</strong>된다. 예: hash
+        123456은 N=10이면 노드 6, N=11이면 노드 3, N=12이면 노드 0.
+      </blockquote>
+      <div class="callout">
+        <strong>심층 설명</strong> — mod N이 나쁜 이유는 "N이 수식 안에 박혀
+        있다"는 것 자체다. 노드 하나만 추가해도 거의 모든 key의 mod 결과가
+        바뀌므로, 클러스터 전체가 데이터를 서로 주고받는 대이동이 일어난다 —
+        rebalancing의 목표(최소 이동)와 정반대다. 좋은 전략들의 공통 원리는
+        <em>key→partition 매핑과 partition→노드 배정을 분리</em>하는 것이다.
+        고정 개수 partition에서는 key→partition은 영원히 불변이고, 노드가 늘면
+        partition 몇 개만 통째로 새 노드로 옮긴다(이동량 ≈ 1/노드 수). 동적
+        partitioning과 노드 비례 방식도 마찬가지로 "옮기는 단위"를 partition으로
+        국한한다. 즉 rebalancing 설계의 핵심 질문은 "노드 수가 바뀔 때 무엇이
+        불변으로 남는가"이며, mod N은 불변인 것이 하나도 없어서 실격이다.
+      </div>
+
+      <h3>Rebalancing — 실제 전략들</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>전략</th>
+            <th>동작</th>
+            <th>특징 / 주의점</th>
+            <th>시스템</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>고정 개수 partition</strong></td>
+            <td>
+              노드 수보다 훨씬 많은 partition을 처음부터 생성 (예: 노드 10대에
+              1,000개). 노드 추가 시 partition 몇 개를 통째로 이동
+            </td>
+            <td>
+              key→partition 매핑 불변. <strong>개수 선택이 어렵다</strong> —
+              너무 많으면 관리 오버헤드, 너무 적으면 재분배 여지 없음
+            </td>
+            <td>Riak, Elasticsearch, Couchbase, Voldemort</td>
+          </tr>
+          <tr>
+            <td><strong>동적 partitioning</strong></td>
+            <td>
+              임계 크기 초과 시 <strong>split</strong>, 너무 작으면
+              <strong>merge</strong> — B-tree와 유사
+            </td>
+            <td>
+              partition 수가 데이터 총량에 적응. 빈 DB는 partition 1개로 시작해
+              초기 쓰기가 한 노드에 몰림 → <strong>pre-splitting</strong>으로
+              완화
+            </td>
+            <td>HBase, RethinkDB</td>
+          </tr>
+          <tr>
+            <td><strong>노드 수 비례</strong></td>
+            <td>
+              노드당 partition 수 고정 (Cassandra 기본 256개). 새 노드가 기존
+              partition들을 랜덤하게 골라 절반씩 가져감
+            </td>
+            <td>
+              데이터가 커지면 partition도 커지고, 노드를 늘리면 다시 작아짐
+            </td>
+            <td>Cassandra</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Rebalancing — 자동 vs 수동</h3>
+      <ul>
+        <li>
+          <strong>완전 자동 rebalancing</strong>은 편하지만
+          <strong>위험</strong>하다: 요청 라우팅 변경 + 대량 데이터 이동이라
+          비싸며, 잘못하면 네트워크·노드에 과부하를 준다.
+        </li>
+        <li>
+          최악의 시나리오: <strong>자동 장애 감지와 결합</strong>될 때 —
+          과부하로 느려진 노드를 "죽었다"고 판단해 자동으로 rebalancing을
+          시작하면, 그 부하가 다른 노드와 네트워크를 더 짓눌러
+          <strong>cascading failure</strong>로 번질 수 있다.
+        </li>
+        <li>
+          그래서 <strong>사람이 개입하는</strong> rebalancing이 더 안전한 경우가
+          많다 (Couchbase·Riak·Voldemort는 재배정을 자동 제안하되 적용은 관리자
+          승인).
+        </li>
+      </ul>
+
+      <h3>Request routing (service discovery)</h3>
+      <p>
+        클라이언트는 "key <code>foo</code>가 지금 어느 노드에 있는지"를 어떻게
+        아는가? 세 가지 접근:
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>방식</th>
+            <th>설명</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>1</td>
+            <td><strong>아무 노드에나 접속</strong></td>
+            <td>
+              담당이면 처리, 아니면 담당 노드로
+              <strong>전달(forward)</strong>하고 응답을 중계
+            </td>
+          </tr>
+          <tr>
+            <td>2</td>
+            <td><strong>routing tier</strong></td>
+            <td>
+              모든 요청을 partition-aware한 라우팅 계층으로 보내고 거기서 담당
+              노드로 전달 (partition-aware load balancer)
+            </td>
+          </tr>
+          <tr>
+            <td>3</td>
+            <td><strong>partition-aware client</strong></td>
+            <td>클라이언트가 partition→노드 매핑을 직접 알고 바로 접속</td>
+          </tr>
+        </tbody>
+      </table>
+      <ul>
+        <li>
+          핵심 난제는
+          <strong
+            >라우팅 주체가 partition 배정 변화를 어떻게 최신으로 아느냐</strong
+          >다.
+        </li>
+        <li>
+          많은 시스템은 <strong>ZooKeeper</strong> 같은 별도 coordination
+          service에 cluster metadata를 두고, 변경 시 라우팅 계층에 통지한다
+          (HBase, SolrCloud, Kafka; MongoDB는 자체 config server).
+        </li>
+        <li>
+          <strong>Cassandra와 Riak은 gossip protocol</strong>을 사용 — 노드끼리
+          cluster 상태 변화를 서로 퍼뜨리고, 아무 노드나 요청을 받아 올바른
+          노드로 전달한다 (외부 coordination service 불필요, 방식 1).
+        </li>
+        <li>
+          <strong>MPP(massively parallel processing)</strong> 분석용 DB는
+          join·filter·group·aggregation을 포함하는 복잡한 query를 여러
+          stage·partition으로 쪼개 병렬 실행하는 훨씬 정교한 query 최적화를 한다
+          (자세한 내용은 Ch10).
+        </li>
+      </ul>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Partitioning — 백과사전 분권</h3>
+        <p>
+          한 권에 다 담을 수 없으니 A–B권, C–D권으로 나눈다. "B로 시작하는
+          단어"를 찾으면 한 권만 보면 된다 (key range partitioning + range
+          scan).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Hot spot — 인기 창구</h3>
+        <p>
+          은행 창구 10개를 열어도 모두가 "1번 창구 직원"만 찾으면 나머지 9개는
+          놀고 1번만 줄이 늘어선다. 창구를 늘려도(partition 추가) 소용없다 —
+          손님을 분산시키는 건 결국 운영자(application)의 몫이다 (celebrity key
+          + random suffix).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Key range vs hash — 도서관 vs 물품보관함</h3>
+        <p>
+          도서관은 주제별로 정렬돼 있어 "역사책 구역"을 통째로 훑기 좋다(range
+          scan). 물품보관함은 번호가 무작위로 배정돼 자리가 골고루 차지만, "내
+          짐들끼리 나란히"는 포기해야 한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Local vs global index — 지점별 장부 vs 본사 통합 장부</h3>
+        <p>
+          지점별 장부(local index)는 기록(쓰기)이 그 지점에서 끝나지만, "빨간 차
+          전부 찾기"는 모든 지점에 전화를 돌려야 한다(scatter/gather). 본사 통합
+          장부(global index)는 찾을 땐 한 곳만 보면 되지만, 판매(쓰기) 한 건마다
+          본사의 여러 장부 담당자에게 통지해야 하고, 통지가 늦게 반영될 수
+          있다(비동기 갱신).
+        </p>
+      </div>
+      <div class="card">
+        <h3>hash mod N — 반 배정을 반 개수로 다시 계산하기</h3>
+        <p>
+          "출석번호 % 반 개수"로 반을 배정하면, 반이 하나 늘어날 때마다 거의
+          모든 학생이 반을 옮겨야 한다. 좋은 rebalancing은 전학생 몇 명만
+          이동시킨다 (partition 통째 이동).
+        </p>
+      </div>
+      <div class="card">
+        <h3>자동 rebalancing의 위험 — 과로한 직원을 결근 처리</h3>
+        <p>
+          바빠서 응답이 늦은 직원을 "결근"으로 간주하고 그의 업무를 옆자리로
+          자동 재배정하면, 옆자리도 과로로 쓰러진다 — cascading failure.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Partition (shard)</strong></td>
+            <td>
+              데이터셋을 나눈 조각. 각 record는 정확히 하나의 partition에 속함
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Skew</strong></td>
+            <td>데이터나 부하가 partition 간에 불공평하게 분포된 상태</td>
+          </tr>
+          <tr>
+            <td><strong>Hot spot</strong></td>
+            <td>불균형하게 높은 부하를 받는 partition</td>
+          </tr>
+          <tr>
+            <td><strong>Key range partitioning</strong></td>
+            <td>
+              연속된 key 구간을 partition에 할당 (정렬 유지, range scan 유리)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Hash partitioning</strong></td>
+            <td>
+              key의 hash 값으로 partition 결정 (균등 분산, range query 비효율)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Consistent hashing</strong></td>
+            <td>
+              hash 구간을 무작위 경계로 나누는 기법의 명칭 — 책은 혼란을 피해
+              hash partitioning이라 부르길 권장
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Compound primary key</strong></td>
+            <td>
+              Cassandra: 첫 column은 hash로 partition 결정, 나머지 column은
+              정렬용
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Local index (document-partitioned)</strong></td>
+            <td>
+              각 partition이 자기 document만 색인. 쓰기 국소적, 읽기는
+              scatter/gather
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Global index (term-partitioned)</strong></td>
+            <td>
+              index 자체를 term 기준으로 partition. 읽기 국소적, 쓰기는 여러
+              partition
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Scatter/gather</strong></td>
+            <td>모든 partition에 query를 뿌리고 결과를 모으는 읽기 패턴</td>
+          </tr>
+          <tr>
+            <td><strong>Tail latency amplification</strong></td>
+            <td>병렬 요청 중 가장 느린 응답이 전체 지연을 좌우하는 현상</td>
+          </tr>
+          <tr>
+            <td><strong>Rebalancing</strong></td>
+            <td>partition을 노드 간에 재배치해 부하를 다시 고르게 하는 작업</td>
+          </tr>
+          <tr>
+            <td><strong>Fixed number of partitions</strong></td>
+            <td>
+              노드 수보다 훨씬 많은 partition을 미리 만들고 통째로 이동하는 전략
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Dynamic partitioning</strong></td>
+            <td>크기에 따라 partition을 split/merge (B-tree 유사)</td>
+          </tr>
+          <tr>
+            <td><strong>Pre-splitting</strong></td>
+            <td>빈 DB에 초기 partition들을 미리 설정해 초기 hot spot을 방지</td>
+          </tr>
+          <tr>
+            <td><strong>Gossip protocol</strong></td>
+            <td>
+              노드끼리 cluster 상태 변화를 서로 전파하는 방식 (Cassandra, Riak)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>ZooKeeper</strong></td>
+            <td>cluster metadata를 보관·통지하는 coordination service</td>
+          </tr>
+          <tr>
+            <td><strong>MPP</strong></td>
+            <td>
+              massively parallel processing — 복잡한 분석 query를 여러
+              partition에서 병렬 실행
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        큰 데이터와 높은 부하를 여러 노드에 <strong>골고루</strong> 나누기 위해
+        key range 또는 hash로 partition하고(range scan vs 균등 분산의
+        trade-off), secondary index는 local(쓰기 유리) / global(읽기 유리)로
+        나뉘며, rebalancing은 <strong>필요 최소한의 데이터만</strong> 옮기는
+        전략(고정 개수·동적·노드 비례)을 쓰고, 요청은 forwarding·routing
+        tier·partition-aware client 중 하나로 올바른 partition을 찾아간다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch05.html">← Ch5. Replication</a
+        ><a href="index.html">목차 →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "partitioning의 주된 목적은?",
+          options: [
+            "데이터 암호화",
+            "scalability — 데이터와 query 부하를 여러 노드에 분산",
+            "데이터 압축",
+            "트랜잭션 격리 수준 향상",
+          ],
+          answer: 1,
+          expl: "partitioning의 목적은 scalability: 큰 데이터셋과 query 부하를 여러 노드·디스크에 분산.",
+        },
+        {
+          type: "mcq",
+          q: "partitioning과 replication의 관계로 옳은 것은?",
+          options: [
+            "둘은 함께 쓸 수 없다",
+            "한 노드는 어떤 partition들의 leader이면서 동시에 다른 partition들의 follower일 수 있다",
+            "replication을 쓰면 partitioning이 불필요하다",
+            "각 노드는 정확히 하나의 partition만 가진다",
+          ],
+          answer: 1,
+          expl: "partitioning은 보통 replication과 결합되며, 한 노드가 어떤 partition의 leader이자 다른 partition의 follower가 된다.",
+        },
+        {
+          type: "mcq",
+          q: '"hot spot"의 정의로 옳은 것은?',
+          options: [
+            "CPU 온도가 높은 노드",
+            "불균형하게 높은 부하를 받는 partition",
+            "가장 최근에 생성된 partition",
+            "replication이 없는 partition",
+          ],
+          answer: 1,
+          expl: "hot spot = 불균형하게 높은 부하를 받는 partition. 분포가 불공평한 상태 자체는 skew.",
+        },
+        {
+          type: "mcq",
+          q: "key range partitioning의 장점은?",
+          options: [
+            "key가 정렬되어 있어 range scan이 효율적이다",
+            "어떤 workload에서도 hot spot이 생기지 않는다",
+            "hash 계산이 필요 없어 항상 빠르다",
+            "rebalancing이 전혀 필요 없다",
+          ],
+          answer: 0,
+          expl: "key가 정렬 유지되어 range scan이 쉽다. 대신 접근 패턴에 따라 hot spot 위험이 있다.",
+        },
+        {
+          type: "mcq",
+          q: "timestamp를 key로 하는 sensor 데이터를 key range로 partition하면 생기는 문제와 완화책은?",
+          options: [
+            "읽기 몰림 — 캐시 추가",
+            "오늘 쓰는 데이터가 한 partition에 몰림 — key 앞에 sensor 이름을 prefix로 붙여 분산",
+            "데이터 손실 — replication 추가",
+            "정렬 불가 — hash로 전환만이 유일한 해법",
+          ],
+          answer: 1,
+          expl: "timestamp key는 '오늘' partition에 쓰기가 몰린다. sensor 이름 prefix로 분산되지만, 전체 sensor의 시간 범위 조회는 여러 query가 필요해진다.",
+        },
+        {
+          type: "mcq",
+          q: "hash partitioning의 대가(단점)는?",
+          options: [
+            "데이터가 항상 skew된다",
+            "인접 key가 흩어져 range query를 모든 partition에 보내야 한다",
+            "쓰기가 불가능해진다",
+            "hash 충돌로 데이터가 소실된다",
+          ],
+          answer: 1,
+          expl: "hash가 인접 key를 흩어놓아 정렬이 사라지고, range query는 모든 partition에 보내야 한다.",
+        },
+        {
+          type: "mcq",
+          q: "Cassandra의 compound primary key 방식으로 옳은 것은?",
+          options: [
+            "모든 column을 hash한다",
+            "첫 column만 hash해 partition을 정하고, 나머지 column은 정렬에 사용한다",
+            "마지막 column만 hash한다",
+            "hash를 전혀 쓰지 않는다",
+          ],
+          answer: 1,
+          expl: "첫 column만 hash로 partition을 정하고, 나머지 column은 partition 내 정렬(SSTable)에 쓰여 range scan이 가능하다.",
+        },
+        {
+          type: "mcq",
+          q: "celebrity 한 명의 key에 쓰기가 폭주하는 극단적 skew에 대한 책의 설명으로 옳은 것은?",
+          options: [
+            "hash partitioning이 자동으로 해결한다",
+            "대부분의 시스템은 자동 보정하지 못하며, key에 random suffix를 붙이는 등 application의 책임이다",
+            "replication만 늘리면 해결된다",
+            "key range partitioning으로 전환하면 해결된다",
+          ],
+          answer: 1,
+          expl: "극단적 skew는 현재 시스템이 자동 보정하지 못하며 application의 책임이다 (random suffix 등).",
+        },
+        {
+          type: "mcq",
+          q: "hot key에 random suffix(예: 00~99)를 붙이는 기법의 대가는?",
+          options: [
+            "쓰기가 느려진다",
+            "읽기 시 쪼개진 key를 전부 읽어 합쳐야 하고, 어떤 key를 쪼갰는지 추적해야 한다",
+            "데이터가 암호화된다",
+            "partition 수가 줄어든다",
+          ],
+          answer: 1,
+          expl: "쓰기는 100개 key로 분산되지만, 읽기는 전부 읽어 합쳐야 하고 관리도 필요하다. 그래서 소수의 hot key에만 적용.",
+        },
+        {
+          type: "mcq",
+          q: "document 기반(local) secondary index의 특징으로 옳은 것은?",
+          options: [
+            "쓰기는 해당 partition만 갱신하면 되지만, 읽기는 모든 partition에 scatter/gather해야 한다",
+            "읽기는 한 partition만 보면 되지만, 쓰기가 여러 partition을 건드린다",
+            "index가 항상 한 노드에 집중된다",
+            "range scan이 불가능해진다",
+          ],
+          answer: 0,
+          expl: "local index는 쓰기 국소적, 읽기는 scatter/gather (+ tail latency amplification 취약). (두 번째 선택지는 global index 설명.)",
+        },
+        {
+          type: "mcq",
+          q: "term 기반(global) secondary index에서 쓰기가 복잡해지는 이유는?",
+          options: [
+            "index가 메모리에만 존재해서",
+            "한 document의 여러 term이 서로 다른 index partition에 있을 수 있어 쓰기가 여러 partition을 건드린다",
+            "쓰기 전에 전체 index를 재구축해야 해서",
+            "term이 자동으로 삭제되어서",
+          ],
+          answer: 1,
+          expl: "document의 각 term이 다른 index partition에 있을 수 있어, 쓰기 한 건이 여러 partition을 건드린다.",
+        },
+        {
+          type: "mcq",
+          q: "실무에서 global secondary index 갱신이 보통 비동기인 이유는?",
+          options: [
+            "동기 갱신에는 여러 partition에 걸친 분산 트랜잭션이 필요한데 대부분 지원하지 않아서",
+            "비동기가 항상 더 정확해서",
+            "index는 읽기 전용이라서",
+            "네트워크가 항상 느려서",
+          ],
+          answer: 0,
+          expl: "동기 갱신에는 분산 트랜잭션이 필요한데 대부분 지원하지 않아, 실무(예: DynamoDB GSI)는 비동기 갱신을 쓴다.",
+        },
+        {
+          type: "mcq",
+          q: "rebalancing에 hash(key) mod N을 쓰면 안 되는 이유는?",
+          options: [
+            "hash 계산이 느려서",
+            "노드 수 N이 바뀌면 대부분의 key가 다른 노드로 이동해야 해서",
+            "mod 연산이 음수를 반환해서",
+            "N이 소수여야만 해서",
+          ],
+          answer: 1,
+          expl: "N이 바뀌면 대부분의 key가 재배치되어 이동 비용이 지나치게 크다. rebalancing은 필요 최소한만 옮겨야 한다.",
+        },
+        {
+          type: "mcq",
+          q: '"고정 개수 partition" 전략의 설명으로 옳은 것은?',
+          options: [
+            "노드 수와 partition 수를 항상 같게 유지한다",
+            "노드 수보다 훨씬 많은 partition을 처음부터 만들어 두고, 노드 추가 시 partition 몇 개를 통째로 옮긴다",
+            "partition을 매일 새로 만든다",
+            "partition 크기가 넘치면 자동으로 split한다",
+          ],
+          answer: 1,
+          expl: "많은 partition을 미리 만들고 통째로 이동; key→partition 매핑은 불변. (마지막 선택지는 동적 partitioning.)",
+        },
+        {
+          type: "mcq",
+          q: "완전 자동 rebalancing + 자동 장애 감지 조합의 위험은?",
+          options: [
+            "디스크 용량이 낭비된다",
+            "과부하로 느려진 노드를 죽었다고 판단해 rebalancing을 시작하면 부하가 가중되어 cascading failure로 번질 수 있다",
+            "데이터가 자동 암호화된다",
+            "partition 수가 줄어든다",
+          ],
+          answer: 1,
+          expl: "느려진 노드를 죽었다고 오판 → 자동 rebalancing → 부하 가중 → cascading failure. 그래서 사람 개입이 안전한 경우가 많다.",
+        },
+        {
+          type: "ox",
+          q: "동적 partitioning은 partition이 임계 크기를 넘으면 split하고 너무 작아지면 merge하는, B-tree와 유사한 방식이다.",
+          answer: true,
+          expl: "동적 partitioning은 split/merge로 partition 수가 데이터 총량에 적응하며 B-tree와 유사하다. 빈 DB의 초기 hot spot은 pre-splitting으로 완화.",
+        },
+        {
+          type: "ox",
+          q: 'Cassandra의 "노드 수 비례" 방식은 노드당 partition 수를 고정하고, 새 노드가 기존 partition 몇 개를 랜덤하게 골라 절반씩 가져간다.',
+          answer: true,
+          expl: "Cassandra는 노드당 partition 수 고정(기본 256개), 새 노드가 랜덤 partition들을 절반씩 가져간다.",
+        },
+        {
+          type: "ox",
+          q: "local(document 기반) secondary index는 term 기반 global index보다 읽기가 항상 효율적이다.",
+          answer: false,
+          expl: "반대다. local index는 읽기에 scatter/gather가 필요해 비효율적이고, global index가 읽기에 유리하다 (대신 쓰기가 여러 partition을 건드림).",
+        },
+        {
+          type: "short",
+          q: "클라이언트 요청을 올바른 partition으로 보내는 문제에서, 많은 시스템(HBase, SolrCloud, Kafka)이 cluster metadata를 맡기는 별도 coordination service의 이름은?",
+          answers: ["zookeeper", "주키퍼"],
+          expl: "ZooKeeper — cluster metadata를 보관하고 변경 시 라우팅 계층에 통지하는 coordination service.",
+        },
+        {
+          type: "short",
+          q: "Cassandra와 Riak이 외부 coordination service 없이 노드끼리 cluster 상태 변화를 서로 퍼뜨리는 데 쓰는 프로토콜은?",
+          answers: ["gossip protocol", "gossip", "가십 프로토콜"],
+          expl: "Gossip protocol — 노드끼리 상태 변화를 서로 전파; 아무 노드나 요청을 받아 올바른 노드로 전달한다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>
