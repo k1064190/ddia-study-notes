@@ -42,6 +42,6 @@ Martin Kleppmann의 *Designing Data-Intensive Applications* (DDIA)를 챕터별�
 - [x] [Ch9. Consistency and Consensus](notes/ch09-consistency-and-consensus.md)
 
 ### Part III — Derived Data
-- [ ] Ch10. Batch Processing
-- [ ] Ch11. Stream Processing
-- [ ] Ch12. The Future of Data Systems
+- [x] [Ch10. Batch Processing](notes/ch10-batch-processing.md)
+- [x] [Ch11. Stream Processing](notes/ch11-stream-processing.md)
+- [x] [Ch12. The Future of Data Systems](notes/ch12-future-of-data-systems.md)
