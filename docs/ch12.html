@@ -1,0 +1,842 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch12. The Future of Data Systems — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+        <a href="ch07.html">Ch7</a>
+        <a href="ch08.html">Ch8</a>
+        <a href="ch09.html">Ch9</a>
+        <a href="ch10.html">Ch10</a>
+        <a href="ch11.html">Ch11</a>
+        <a href="ch12.html" class="active">Ch12</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch12. The Future of Data Systems</h1>
+      <p class="subtitle">
+        만능 도구는 없다 — <strong>system of record와 derived data</strong>를
+        구분하고, <strong>로그 + idempotence</strong>로 파생 데이터를 엮는
+        <strong>unbundled database(dataflow 중심 설계)</strong>, 그리고 정확성은
+        <strong>end-to-end</strong>로, 일관성은 timeliness와 integrity로,
+        마지막으로 데이터를 다루는 자의 <strong>윤리</strong>
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        앞선 장들이 데이터 시스템이 <strong>현재 어떻게 동작하는가</strong>를
+        분석했다면, 이 마지막 장은 저자(Martin Kleppmann)의 견해를 담아
+        <strong>어떻게 되어야 하는가</strong>를 탐색한다. 목표는
+        <strong
+          >올바르고(correct), 확장 가능하며(scalable), 유지보수
+          가능한(maintainable)</strong
+        >
+        시스템을 짓는 것이며, 이를 위해 복제·파티셔닝· 트랜잭션·배치·스트림
+        처리를 하나의 큰 그림으로 엮는다.
+      </p>
+      <p>
+        출발점은 냉정한 현실이다 —
+        <strong>모든 요구를 만족하는 단일 도구는 없다</strong>(no
+        one-size-fits-all). 실무는 여러 저장소·인덱스·캐시·분석 시스템을 조합해
+        쓸 수밖에 없고, 남는 문제는 이 이질적 조각들을 어떻게 하나의 일관된
+        시스템으로 통합하는가 — <strong>data integration</strong>이다. 이 장은
+        <strong>data integration</strong> →
+        <strong>unbundling databases</strong> →
+        <strong>aiming for correctness</strong> →
+        <strong>trust but verify</strong> →
+        <strong>doing the right thing(윤리)</strong>로 전개된다.
+      </p>
+      <blockquote>
+        결론부의 핵심 통찰 — 미래의 데이터 시스템은 하나의 거대한 DB가 아니라,
+        <strong>로그로 연결된 파생 데이터의 흐름(dataflow)</strong>으로 구성된
+        <strong>unbundled database</strong>이며, 정확성은 어느 한 계층이 아니라
+        <strong>end-to-end로만</strong> 완성된다.
+      </blockquote>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>Data Integration — 파생 데이터를 동기화하기</h3>
+      <p>
+        어떤 저장소·인덱스·처리 시스템도 모든 접근 패턴을 효율적으로 감당하지
+        못한다. OLTP DB, full-text search index, column 분석 DB, 캐시, 그래프
+        인덱스, ML 모델을 <strong>동시에</strong> 쓰게 되고, 그러면 같은
+        데이터가 여러 곳에 저장되어 <strong>일관되게 유지</strong>해야 하는
+        문제가 생긴다. 이때 핵심 관점이 데이터를 두 종류로 나누는 것이다 —
+        <strong>system of record</strong>(source of truth, 새 데이터가 처음
+        기록되는 권위 있는 원본)와 <strong>derived data</strong>(index, cache,
+        materialized view, ML model 등 원본을 변환해 만든,
+        <strong>잃어도 재생성 가능한</strong> 중복).
+      </p>
+      <p>
+        여러 파생 뷰를 원본과 동기화하는 도구가 앞 두 장의
+        <strong>batch·stream 처리</strong>다. 원본에 쓰기가 일어나면 그 변화를
+        downstream 인덱스·캐시·모델로 전파해 파생 데이터를 최신으로 유지한다.
+        이때 <strong>이벤트의 total order(로그)</strong>가 충돌을 막는 열쇠다 —
+        서로 다른 파생 시스템이 쓰기를 <strong>다른 순서로</strong> 적용하면
+        영구히 불일치하지만, 모든 쓰기를 하나의 로그로 묶어 같은 순서로 소비하면
+        결정론적으로 같은 상태에 수렴한다(state machine replication).
+      </p>
+      <blockquote>
+        단, single total order를 매기는 것은 처리량이 단일 머신을 넘거나 지리적
+        분산 데이터센터가 얽히면 어렵거나 비싸다 — 결국 consensus/leader
+        문제이며 (9장), causality만 보존하고 total order를 포기해야 할 수도
+        있다. 서로 다른 스트림 간 순서, offline·이동 중 클라이언트 이벤트의
+        순서는 근본적으로 미해결 영역이다.
+      </blockquote>
+      <p>
+        <strong>Derived state vs distributed transactions</strong>: 여러
+        시스템을 일관되게 유지하는 전통적 방법은 distributed
+        transaction(2PC)이지만 성능·운영상 취약하다. 대안이
+        <strong>log 기반 파생 + idempotence</strong>다.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Distributed transaction (2PC)</th>
+            <th>Log-based derivation</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>결합</strong></td>
+            <td>tight coupling (atomic commit, 동기)</td>
+            <td>loose coupling (asynchronous)</td>
+          </tr>
+          <tr>
+            <td><strong>순서 조정</strong></td>
+            <td>mutual exclusion(lock)</td>
+            <td>로그의 total order</td>
+          </tr>
+          <tr>
+            <td><strong>실패 대응</strong></td>
+            <td>atomic 2PC — coordinator SPOF</td>
+            <td>idempotence + 재시도로 복구</td>
+          </tr>
+          <tr>
+            <td><strong>최신성</strong></td>
+            <td>linearizable(즉시 일관)</td>
+            <td>eventually consistent(지연 존재)</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3>Unbundling Databases — 데이터베이스를 분해하기</h3>
+      <p>
+        전통적 DB는 secondary index, materialized view, replication log,
+        full-text search를 <strong>하나의 통합 제품</strong> 안에 감춰 제공한다.
+        Unix가 작은 도구를 파이프로 조립하듯, 이 기능들을
+        <strong>로그를 축으로 분해(unbundling)</strong>하면 각자를 특화 도구로
+        최적화하고 원하는 대로 조립할 수 있다. 통합에는 두 학파가 있다 —
+        <strong>federated database(unified read)</strong>는 여러 이질 저장소
+        위에 통합된 <strong>읽기</strong> 인터페이스(polystore)를 제공하고,
+        <strong>unbundled database(unified write)</strong>는 로그로
+        <strong>쓰기</strong>를 통합하고 거기서 여러 저장소를 파생시킨다 — 이
+        장의 초점은 후자다.
+      </p>
+      <div class="callout">
+        <strong>심층 설명</strong> — unbundling database와 dataflow 중심 설계:
+        파생 데이터를 만드는 규칙(secondary index를 만드는 함수, cache를
+        갱신하는 함수, ML 모델을 학습하는 함수)은 사실
+        <strong>애플리케이션 특화된 파생 함수(derivation function)</strong>다.
+        이 세계에서 <strong>stream processor</strong>는 그 함수들을 실행하며
+        시스템들을 연결하는 <strong>접착제(glue)</strong>이자, unbundled DB의
+        trigger·stored procedure·materialized view 유지 엔진에 해당한다. 설계의
+        비유는 <strong>spreadsheet</strong>다 — 한 셀을 바꾸면 그것을 참조하는
+        모든 셀이 <em>자동으로 재계산</em>되듯, 원본이 바뀌면 의존하는 모든 파생
+        뷰가 저절로 갱신되게 짠다(reactive). 이를 위해 쓰기는
+        <strong>불변 이벤트</strong>로 로그에 append하고(events), 읽기는 그
+        이벤트들로부터 파생된 <strong>materialized view</strong>나 on-the-fly
+        계산으로 답한다(views). <strong>write path</strong>(쓰기 시 미리 계산)와
+        <strong>read path</strong>(요청 시 계산) 사이에서
+        <em>어디까지 미리 계산할지</em>가 성능 트레이드오프의 본질이며,
+        클라이언트는 read를 고정된 쿼리가 아니라
+        <strong
+          >변화를 구독하는(subscribe to changes) 살아있는 materialized
+          view</strong
+        >로 다룬다.
+      </div>
+      <div class="callout">
+        <strong>심층 설명</strong> — end-to-end argument와 idempotence 기반
+        exactly-once: 실무의 "exactly-once"는 물리적으로 정확히 한 번 실행이
+        아니라 <strong>effectively-once</strong> — 결과가 한 번 처리한 것과
+        같아지게 만드는 것이고, 수단은
+        <strong>idempotence + 중복 제거(dedup)</strong>다. 그런데 중복 제거가
+        제대로 되려면 <strong>operation을 유일 식별하는 ID</strong>가 필요하고,
+        그 ID는 최종 사용자 요청에서부터 끝단까지
+        <strong>end-to-end로 전달</strong>돼야 한다. 결제 요청에 클라이언트가
+        만든 <strong>request ID</strong>를 실으면, 네트워크 재시도로 요청이 두
+        번 도착해도 서버는 같은 ID를 보고 한 번만 처리한다.
+        <strong>end-to-end argument</strong>(Saltzer, Reed, Clark)의 요지: 중복
+        없는 정확한 처리 같은 보장은 통신 경로의 <strong>양 끝점</strong>에서만
+        완전히 구현되며, TCP 재전송이나 DB 트랜잭션 같은
+        <strong>하위 계층의 부분 보장은 도움은 되나 충분하지 않다</strong>(앱
+        재시작·중복 제출까지 막지 못하므로). transaction은 사라지지 않고
+        <strong>다르게 조립</strong>될 뿐이다.
+      </div>
+
+      <h3>Aiming for Correctness — 정확성을 겨냥하기</h3>
+      <p>
+        "consistency"라는 말은 사실 두 개의 다른 요구를 뭉뚱그린다. 이를
+        분리하는 것이 이 절의 핵심 통찰이다.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th></th>
+            <th>Timeliness (적시성)</th>
+            <th>Integrity (무결성)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>의미</strong></td>
+            <td>사용자가 최신 상태를 본다</td>
+            <td>데이터가 손상·모순 없음</td>
+          </tr>
+          <tr>
+            <td><strong>위반 시</strong></td>
+            <td>eventual consistency — 잠시 옛 값을 봄</td>
+            <td>corruption — 파생 데이터가 원본과 영구 불일치</td>
+          </tr>
+          <tr>
+            <td><strong>복구</strong></td>
+            <td>기다리면 해소(recoverable)</td>
+            <td>저절로 낫지 않음 — 수동 수정 필요</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="callout">
+        <strong>심층 설명</strong> — timeliness vs integrity 구분: 핵심 주장은
+        <strong
+          >대부분의 애플리케이션은 timeliness보다 integrity를 훨씬 더
+          중시한다</strong
+        >는 것이다. 잔고가 몇 초 늦게 갱신되는 것(timeliness 위반)은 견딜 수
+        있지만, 돈이 사라지거나 이중 청구되는 것(integrity 위반)은 재앙이고
+        <em>저절로 낫지 않는다</em>. 그리고
+        <strong
+          >ACID의 atomicity와 durability가 바로 integrity를 지키는 도구</strong
+        >다. log 기반 dataflow는 이 통찰을 활용한다 — 이벤트를 원자적으로 로그에
+        append하고 결정론적· idempotent하게 파생하면,
+        <strong>timeliness는 느슨하게(async, eventual)</strong> 두더라도
+        <strong>integrity는 완전히</strong> 보장할 수 있다. 즉 distributed
+        transaction의 강한 동기화 없이도 무결성을 얻는다.
+      </div>
+      <p>
+        <strong>Log 기반 제약(constraint) 강제</strong>: uniqueness
+        constraint(username 유일성, 잔고 ≥ 0, 재고 초과 판매 방지)는 consensus와
+        동등한 어려운 문제다(9장). 로그 기반 접근은 —
+      </p>
+      <ul>
+        <li>
+          <strong>같은 파티션으로 라우팅</strong>: 충돌 가능한 연산(같은
+          username을 claim하는 요청들)을 같은 파티션의 같은 로그로 보내면, 그
+          안의 <strong>total order</strong>로 "처음 claim한 자 승리, 나머지
+          거부"를 결정론적·linearizable하게 판정한다.
+        </li>
+        <li>
+          <strong>Multi-partition 비동기 버전</strong>: 여러 파티션에 걸친
+          제약(발신·수신 계좌가 다른 파티션)은 각 단계를 별도 이벤트로 쪼개
+          <strong>각각 idempotent하게</strong> 처리하면 원자적 커밋 없이
+          무결성을 유지한다 — 일시적 위반을 거칠 수 있고, 필요하면
+          <strong>보상 트랜잭션(compensating transaction)</strong>으로 되돌린다.
+        </li>
+      </ul>
+      <p>
+        <strong>Coping with faults</strong>: 무결성은 어느 한 계층의
+        트랜잭션만으로 완성되지 않는다. 하드웨어·소프트웨어 버그, 중복 요청,
+        사람의 실수까지 감안하면 정확성은
+        <strong>end-to-end 식별자 + idempotence</strong>로 받쳐야 한다. log 기반
+        시스템은 결정론적 재처리가 가능하므로, 버그를 고친 뒤
+        <strong>로그를 다시 돌려 파생 데이터를 재생성</strong>하는 강력한 복구를
+        제공한다.
+      </p>
+
+      <h3>Trust, but Verify — 믿되, 검증하라</h3>
+      <ul>
+        <li>
+          <strong>맹신하지 말라</strong>: 하드웨어는 조용히 데이터를
+          손상(<strong>silent corruption</strong>)시키고 소프트웨어엔 버그가
+          있으며 복제·백업조차 완벽하지 않다. "데이터는 한 번 맞으면 영원히
+          맞다"는 가정은 틀렸다 — 시간이 지나면 어디선가 반드시 썩는다.
+        </li>
+        <li>
+          <strong>Auditing과 self-validation</strong>: 체크섬으로 손상을
+          탐지하고, 파생 데이터를 원본으로부터 재계산해
+          <strong>주기적으로 대조</strong>하며, 이벤트 로그의 불변성을 이용해
+          "현재 상태가 정말 이 이벤트들의 결과인가"를 확인한다(회계 감사처럼).
+        </li>
+        <li>
+          <strong>event-based의 감사 이점</strong>: 불변 이벤트 로그는 상태
+          변화의 완전한 이력(<strong>provenance</strong>)을 남겨, 문제 원인
+          추적·재구성이 mutable 상태만 있는 시스템보다 훨씬 쉽다. 정확성은 한 번
+          확보하고 끝이 아니라 <strong>계속 감사해 지켜야</strong> 한다.
+        </li>
+      </ul>
+
+      <h3>Doing the Right Thing — 엔지니어의 윤리</h3>
+      <p>
+        기술을 넘어, 저자는 데이터 시스템을 만드는 사람의
+        <strong>윤리적 책임</strong>을 정면으로 다룬다. 코드와 데이터는
+        중립적이지 않다.
+      </p>
+      <ul>
+        <li>
+          <strong>편향·차별(bias &amp; discrimination)</strong>: 알고리즘이
+          대출·채용·보험·형량을 좌우할 때 학습 데이터에 담긴 과거의 편향이
+          그대로 재생산·증폭된다. "데이터는 객관적"이라는 믿음이 오히려 차별을
+          정당화한다.
+        </li>
+        <li>
+          <strong>Feedback loops</strong>: 예측이 현실을 바꾸고 그 현실이 다시
+          예측을 강화하는 악순환. 특정 동네를 "위험"으로 예측 → 경찰 집중 → 더
+          많은 체포 기록 → 더 "위험"한 데이터. 모델이 자기실현적 예언이 된다.
+        </li>
+        <li>
+          <strong>Algorithmic prisons</strong>: 알고리즘 판정으로
+          기회(신용·취업· 이동)가 막히면, 당사자는
+          <strong>왜 거부됐는지 알 수도 항변할 수도 없는</strong> 보이지 않는
+          감옥에 갇힌다.
+        </li>
+        <li>
+          <strong>Privacy와 consent</strong>: 형식적 약관 동의는 데이터가 어떻게
+          결합·추론·판매될지 이해한 <strong>informed consent</strong>가 아니다.
+          감시(surveillance)가 서비스의 대가로 정상화된다.
+        </li>
+        <li>
+          <strong>데이터는 자산이자 위험물</strong>: "data is the new oil"은
+          데이터를 무한 축적할 자산으로만 본다. 하지만 축적된 개인정보는
+          유출·오용· 감시의 <strong>위험물(toxic asset)</strong>이기도 하다 —
+          원유가 환경을 오염시키듯.
+          <strong>모으지 않은 데이터는 유출될 수 없다.</strong>
+        </li>
+        <li>
+          <strong>엔지니어의 책임</strong>: "나는 시키는 대로 만들 뿐"이라는
+          태도를 저자는 거부한다. 무엇을 수집하고 어떻게 쓰며 누구에게 해를 끼칠
+          수 있는지 <strong>설계 단계에서 능동적으로 고민</strong>하는 것이
+          직업적 책임이다 — 기술적 탁월함과 윤리적 책임은 분리될 수 없다.
+        </li>
+      </ul>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Data integration — 주방의 여러 도구</h3>
+        <p>
+          만능 조리기구 하나로 모든 요리를 할 수 없어 칼·냄비·오븐·믹서를 함께
+          쓴다. 중요한 건 <strong>같은 재료(원본)</strong>를 여러 도구가 각자
+          다루되 <strong>한 접시(일관된 결과)</strong>로 모이게 하는 조율이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>System of record vs derived — 원본 계약서와 복사본</h3>
+        <p>
+          금고 속 원본 계약서 하나가 진실이고, 곳곳의 복사본·요약본·색인은
+          원본에서 언제든 다시 만들 수 있다. 복사본이 타 버려도 원본만 있으면
+          복원된다 — derived data의 본질.
+        </p>
+      </div>
+      <div class="card">
+        <h3>로그의 total order — 은행 창구의 단일 대기줄</h3>
+        <p>
+          여러 창구(파생 시스템)가 각자 손님을 받으면 순번이 엉킨다.
+          <strong>하나의 번호표 줄</strong>에 세우면 모든 창구가 같은 순서로
+          처리해 결과가 어긋나지 않는다 — 이벤트 로그가 이 번호표 줄이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Unbundling database — 전문병원 네트워크</h3>
+        <p>
+          모든 과를 한 건물에 넣은 종합병원(monolithic DB) 대신, 전문병원들을
+          <strong>공통 진료기록(로그)</strong>으로 연결한 네트워크. 각 병원은
+          자기 분야에 최적화되고, 진료기록이 흐르며 전체가 일관된다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Dataflow / reactive — 스프레드시트의 자동 재계산</h3>
+        <p>
+          A1 셀을 고치면 <code>=A1*2</code>인 B1이 저절로 갱신된다. 누구도 B1을
+          수동으로 다시 계산하지 않는다. 데이터 시스템도 원본이 바뀌면 파생 뷰가
+          <strong>저절로</strong> 갱신되게 짜자는 것이 dataflow 설계.
+        </p>
+      </div>
+      <div class="card">
+        <h3>읽기 = materialized view — 미리 만든 반찬 vs 즉시 조리</h3>
+        <p>
+          쓰기(events)는 장을 보는 것, 읽기는 밥상을 차리는 것. 자주 나가는
+          반찬은
+          <strong>미리 만들어 두고(materialized view)</strong>, 드문 요청은
+          <strong>주문받고 그때 조리(on-the-fly)</strong>한다. 어디까지 미리
+          만들지가 write path/read path의 균형이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>End-to-end argument — 등기우편의 수령 확인</h3>
+        <p>
+          우체국(TCP/DB)이 "배달했다"고 보증해도, 받는 사람 본인의
+          <strong>서명(end-to-end 식별자)</strong>이 없으면 "정말 그 사람이
+          받았는가"는 보장되지 않는다. 편지가 두 번 와도 같은 등기번호를 보고
+          "이미 받은 것"으로 처리해야 중복이 없다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Idempotence — 엘리베이터 버튼</h3>
+        <p>
+          버튼을 세 번 눌러도 엘리베이터는 한 번만 온다. 요청(누름)에 붙은
+          정체성(같은 층 호출)이 같으면
+          <strong>여러 번 처리해도 결과가 한 번과 같다</strong> — idempotence.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Timeliness vs Integrity — 늦은 영수증 vs 틀린 잔고</h3>
+        <p>
+          카드를 긁고 영수증이 5초 늦게 뜨는 것(timeliness 위반)은 참을 수 있다.
+          하지만 <strong>결제 금액이 틀리거나 이중 청구</strong>되는
+          것(integrity 위반)은 절대 안 된다 — 저절로 낫지 않고 손으로 바로잡아야
+          한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Trust but verify — 정기 재고 실사</h3>
+        <p>
+          장부(파생 데이터)가 맞다고 믿지 말고 주기적으로
+          <strong>창고를 직접 세어(원본 재계산)</strong> 장부와 대조한다. 시간이
+          지나면 어디선가 수량이 어긋나기 마련 — 감사만이 무결성을 지킨다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Data as hazard — 유조선의 기름</h3>
+        <p>
+          기름(데이터)은 자산이지만 유출되면 해안을 뒤덮는 재앙이다. "새로운
+          석유"라 무작정 채굴·비축하기 전에, 그 저장고가 터졌을 때의 피해(유출·
+          감시·오용)를 먼저 생각해야 한다.
+          <strong>모으지 않은 기름은 새지 않는다.</strong>
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Data integration</strong></td>
+            <td>
+              이질적 여러 저장소·인덱스·처리 시스템을 하나의 일관된 시스템으로
+              통합하는 문제
+            </td>
+          </tr>
+          <tr>
+            <td><strong>System of record</strong></td>
+            <td>새 데이터가 처음 권위 있게 기록되는 원본(source of truth)</td>
+          </tr>
+          <tr>
+            <td><strong>Derived data</strong></td>
+            <td>
+              원본을 변환해 만든 중복(index, cache, view, ML model) — 잃어도
+              재생성 가능
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Dataflow</strong></td>
+            <td>
+              원본의 변화를 batch·stream 처리로 파생 데이터에 전파하는 흐름 중심
+              아키텍처
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Total order (of events)</strong></td>
+            <td>
+              모든 쓰기를 하나의 로그 순서로 묶어 같은 순서로 소비 — 충돌 방지
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Log-based derivation</strong></td>
+            <td>
+              distributed transaction 대신 로그 + idempotence로 파생 데이터를
+              느슨하게 동기화
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Unbundling databases</strong></td>
+            <td>
+              DB 내부 기능(index, materialized view, replication log)을 로그를
+              축으로 분해·재조립
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Federated / Unbundled database</strong></td>
+            <td>
+              통합된 읽기(unified read, polystore) / 로그로 쓰기 통합(unified
+              write) 후 파생
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Derivation function</strong></td>
+            <td>
+              원본에서 파생 데이터를 만드는 앱 특화 함수 (stream processor가
+              실행)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Materialized view</strong></td>
+            <td>
+              미리 계산해 저장한 읽기용 뷰 — read를 살아있는 뷰로 보는 관점
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Write path / Read path</strong></td>
+            <td>
+              쓰기 시 미리 계산 vs 읽기 시 계산 — 어디까지 선계산할지의
+              트레이드오프
+            </td>
+          </tr>
+          <tr>
+            <td><strong>End-to-end argument</strong></td>
+            <td>
+              어떤 정확성 보장은 통신 경로의 양 끝점에서만 완전 — 하위
+              계층만으론 불충분 (Saltzer, Reed, Clark)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Exactly-once (effectively-once)</strong></td>
+            <td>
+              결과가 한 번 처리한 것과 같아지게 함 — idempotence + dedup으로
+              달성
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Idempotence</strong></td>
+            <td>같은 연산을 여러 번 적용해도 결과가 한 번과 동일</td>
+          </tr>
+          <tr>
+            <td><strong>Unique operation identifier</strong></td>
+            <td>
+              요청을 유일 식별하는, end-to-end로 전달되는 ID — dedup의 열쇠
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Timeliness</strong></td>
+            <td>
+              최신 상태를 보는 성질 — 위반은 eventual consistency(복구 가능)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Integrity</strong></td>
+            <td>
+              데이터가 손상·모순 없는 성질 — 위반은 corruption(복구 어려움)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Constraint enforcement (log)</strong></td>
+            <td>충돌 연산을 같은 파티션 로그로 라우팅해 결정론적으로 판정</td>
+          </tr>
+          <tr>
+            <td><strong>Compensating transaction</strong></td>
+            <td>
+              잘못 적용된 연산을 되돌리는 보상 연산 (다단계 비동기 제약에서)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Auditing / Silent corruption</strong></td>
+            <td>
+              파생 데이터를 원본과 대조·재계산해 지속 검증 / 조용히 일어나는
+              데이터 손상
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Provenance</strong></td>
+            <td>
+              불변 이벤트 로그가 남기는 상태 변화의 완전한 이력 (감사 이점)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Feedback loop</strong></td>
+            <td>
+              예측이 현실을 바꾸고 그 현실이 예측을 강화하는 자기실현적 악순환
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Algorithmic prison</strong></td>
+            <td>
+              알고리즘 판정으로 기회가 막히나 이유를 알거나 항변할 수 없는 상태
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Data as asset and hazard</strong></td>
+            <td>
+              데이터는 자산이자 유출·감시의 위험물(toxic asset) — "data is the
+              new oil"의 이면
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Informed consent</strong></td>
+            <td>
+              데이터가 어떻게 쓰일지 진정으로 이해한 동의 — 형식적 약관 동의와
+              구별
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        만능 도구는 없으므로 미래의 데이터 시스템은
+        <strong>system of record와 derived data</strong>를 구분하고,
+        <strong>로그의 total order + idempotence</strong>로 파생 데이터를
+        느슨하게 동기화하는 <strong>unbundled database</strong>(dataflow 중심
+        설계)로 나아간다 — distributed transaction 대신 로그 기반 파생을,
+        정확성은 어느 한 계층이 아니라 <strong>end-to-end 식별자</strong>로,
+        일관성은
+        <strong>timeliness(복구 가능)와 integrity(치명적)의 구분</strong>으로
+        다루며, 무엇보다 데이터를
+        <strong>믿되 끊임없이 검증(auditing)</strong>하고,
+        편향·감시·프라이버시에 대한 <strong>엔지니어의 윤리적 책임</strong>을
+        잊지 말아야 한다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch11.html">← Ch11. Stream Processing</a
+        ><a href="index.html">목차 →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "이 장이 data integration의 출발점으로 삼는 전제는?",
+          options: [
+            "하나의 강력한 데이터베이스가 모든 요구를 만족한다",
+            "모든 요구를 만족하는 단일 도구는 없으므로, 특화된 여러 도구를 조합해야 한다",
+            "분산 트랜잭션이 모든 통합 문제를 해결한다",
+            "데이터는 절대 중복 저장하면 안 된다",
+          ],
+          answer: 1,
+          expl: "이 장의 출발점은 'no one-size-fits-all'. 어떤 단일 도구도 모든 접근 패턴을 효율적으로 감당하지 못하므로 특화 도구들을 조합해야 하고, 그 조합을 일관되게 엮는 것이 data integration이다.",
+        },
+        {
+          type: "mcq",
+          q: "system of record와 derived data의 구분으로 옳은 것은?",
+          options: [
+            "둘 다 동등하게 권위 있는 원본이다",
+            "system of record는 권위 있는 원본, derived data는 그것을 변환해 만든 재생성 가능한 중복(index, cache, view, ML model)이다",
+            "derived data는 잃어버리면 영영 복구할 수 없다",
+            "system of record는 항상 캐시를 의미한다",
+          ],
+          answer: 1,
+          expl: "system of record는 새 데이터가 처음 기록되는 권위 있는 원본(source of truth), derived data는 그것을 변환·처리해 만든 중복이다. derived data는 원본에서 재생성되므로 세 번째는 틀림.",
+        },
+        {
+          type: "mcq",
+          q: "여러 파생 시스템을 일관되게 유지할 때 이벤트의 total order(로그)가 중요한 이유는?",
+          options: [
+            "로그를 압축하기 쉬워서",
+            "서로 다른 파생 시스템이 쓰기를 같은 순서로 적용해야 결정론적으로 같은 상태에 수렴하기 때문 (다른 순서면 영구 불일치)",
+            "로그가 있으면 네트워크가 빨라져서",
+            "total order가 있으면 트랜잭션이 필요 없어져서",
+          ],
+          answer: 1,
+          expl: "파생 시스템들이 쓰기를 서로 다른 순서로 적용하면 영구히 불일치한다. 모든 쓰기를 하나의 로그(total order)로 묶어 같은 순서로 소비하면 결정론적으로 같은 상태에 수렴한다(state machine replication).",
+        },
+        {
+          type: "mcq",
+          q: "이벤트의 single total order를 매기기 어려운 상황이 아닌 것은?",
+          options: [
+            "처리량이 단일 머신 용량을 초과할 때",
+            "지리적으로 분산된 여러 데이터센터가 얽힐 때",
+            "offline·이동 중 클라이언트가 이벤트를 생성할 때",
+            "단일 노드의 단일 스레드가 모든 쓰기를 순차 처리할 때",
+          ],
+          answer: 3,
+          expl: "단일 노드·단일 스레드가 순차 처리하면 자연히 total order가 생겨 어렵지 않다. 나머지(처리량 초과, 지리 분산, offline 클라이언트)는 모두 single total order를 매기기 어렵게 만드는 상황이다.",
+        },
+        {
+          type: "mcq",
+          q: "distributed transaction(2PC) 대신 log 기반 파생을 쓸 때의 특징은?",
+          options: [
+            "tight coupling과 동기 atomic commit",
+            "loose coupling·asynchronous — 로그의 total order로 순서를 조정하고 idempotence로 실패를 복구, 대신 eventual consistency",
+            "linearizable하므로 지연이 전혀 없다",
+            "coordinator SPOF 문제가 그대로 남는다",
+          ],
+          answer: 1,
+          expl: "log 기반 파생은 loose coupling·asynchronous다. 로그의 total order로 순서를 맞추고 idempotence로 실패를 복구하며, 대가로 eventual consistency를 받아들인다. 2PC의 tight coupling·coordinator SPOF와 대비된다.",
+        },
+        {
+          type: "mcq",
+          q: "'unbundling databases'의 의미로 가장 정확한 것은?",
+          options: [
+            "데이터베이스를 여러 대에 복제하는 것",
+            "DB가 통합 제공하던 기능(secondary index, materialized view, replication log)을 로그를 축으로 분해해 특화 도구로 재조립하는 것",
+            "데이터베이스를 완전히 없애는 것",
+            "SQL을 NoSQL로 바꾸는 것",
+          ],
+          answer: 1,
+          expl: "unbundling은 DB가 통합 제공하던 기능들을 로그를 축으로 분해해 특화 도구로 최적화·재조립하는 것이다(Unix 철학의 데이터 시스템판).",
+        },
+        {
+          type: "mcq",
+          q: "federated database(unified read)와 unbundled database(unified write)의 차이는?",
+          options: [
+            "둘은 같은 개념이다",
+            "federated는 여러 저장소 위에 통합된 읽기 인터페이스를, unbundled는 로그로 쓰기를 통합하고 거기서 여러 저장소를 파생시킨다",
+            "federated가 쓰기를 통합한다",
+            "unbundled는 읽기만 다룬다",
+          ],
+          answer: 1,
+          expl: "federated database는 여러 이질 저장소 위에 통합된 읽기 인터페이스(unified read, polystore)를, unbundled database는 로그로 쓰기를 통합(unified write)하고 거기서 여러 저장소를 파생시킨다.",
+        },
+        {
+          type: "mcq",
+          q: "dataflow 중심 설계에서 stream processor의 역할은?",
+          options: [
+            "데이터를 삭제하는 가비지 컬렉터",
+            "애플리케이션 특화 파생 함수를 실행하며 시스템들을 연결하는 접착제 (unbundled DB의 trigger·materialized view maintenance에 해당)",
+            "사용자 인증을 담당",
+            "네트워크 라우팅만 수행",
+          ],
+          answer: 1,
+          expl: "stream processor는 애플리케이션 특화 파생 함수를 실행하며 시스템들을 연결하는 접착제로, unbundled DB의 trigger·stored procedure·materialized view 유지 엔진에 해당한다.",
+        },
+        {
+          type: "mcq",
+          q: "dataflow 설계에서 spreadsheet 비유가 말하는 것은?",
+          options: [
+            "데이터를 표 형태로 저장해야 한다",
+            "원본(셀)이 바뀌면 그에 의존하는 모든 파생 뷰(참조 셀)가 자동으로 재계산되도록 설계하자는 것",
+            "계산을 수동으로 트리거해야 한다",
+            "스프레드시트가 데이터베이스보다 빠르다",
+          ],
+          answer: 1,
+          expl: "스프레드시트에서 셀을 바꾸면 참조 셀이 자동 재계산되듯, 원본이 바뀌면 의존하는 모든 파생 뷰가 자동 갱신되도록 설계하자는 reactive/dataflow 사고다.",
+        },
+        {
+          type: "mcq",
+          q: "쓰기(events)와 읽기(views)를 분리하는 관점에서 read를 보는 방식은?",
+          options: [
+            "read는 항상 원본 테이블을 직접 스캔한다",
+            "read를 이벤트로부터 파생된 materialized view 혹은 on-the-fly 계산으로 보고, write path/read path 사이에서 얼마나 미리 계산할지를 조절한다",
+            "read는 반드시 실시간으로만 계산해야 한다",
+            "read는 쓰기와 완전히 무관하다",
+          ],
+          answer: 1,
+          expl: "read를 이벤트로부터 파생된 materialized view 또는 on-the-fly 계산으로 보고, write path(미리 계산)와 read path(요청 시 계산) 사이에서 선계산 정도를 조절하는 것이 성능 트레이드오프의 핵심이다.",
+        },
+        {
+          type: "mcq",
+          q: "exactly-once 처리를 실제로 달성하는 핵심 수단은?",
+          options: [
+            "연산을 물리적으로 정확히 한 번만 실행하도록 보장하는 하드웨어",
+            "idempotence + 중복 제거(dedup), 그리고 이를 가능케 하는 end-to-end unique operation identifier",
+            "모든 요청을 동기적으로 잠그는 global lock",
+            "재시도를 완전히 금지하는 것",
+          ],
+          answer: 1,
+          expl: "실제 exactly-once는 effectively-once로, idempotence + 중복 제거로 달성한다. 이를 위해 요청을 유일 식별하는 ID가 end-to-end로 전달돼야 한다.",
+        },
+        {
+          type: "mcq",
+          q: "end-to-end argument가 말하는 바로 옳은 것은?",
+          options: [
+            "TCP 재전송만 있으면 애플리케이션 정확성이 완전히 보장된다",
+            "중복 없는 정확한 처리 같은 보장은 통신 경로의 양 끝점에서만 완전히 구현되며, 하위 계층(TCP, DB 트랜잭션)의 부분 보장은 도움은 되나 충분하지 않다",
+            "하위 계층 보장이 있으면 상위 계층은 아무것도 할 필요가 없다",
+            "transaction은 완전히 무의미하다",
+          ],
+          answer: 1,
+          expl: "end-to-end argument: 중복 없는 정확한 처리 같은 보장은 양 끝점(애플리케이션 식별자)에서만 완전히 구현된다. 하위 계층의 부분 보장은 앱 재시작·중복 제출까지 막지 못해 불충분하다. transaction은 여전히 가치 있으나 다르게 조립될 뿐이다.",
+        },
+        {
+          type: "mcq",
+          q: "timeliness와 integrity의 구분으로 옳은 것은?",
+          options: [
+            "timeliness 위반은 corruption이고 integrity 위반은 잠깐의 지연이다",
+            "timeliness 위반은 eventual consistency(기다리면 복구), integrity 위반은 corruption(저절로 낫지 않음)이며, 대부분 앱은 integrity를 더 중시한다",
+            "둘은 같은 것이다",
+            "integrity 위반은 항상 자동 복구된다",
+          ],
+          answer: 1,
+          expl: "timeliness 위반은 잠깐 옛 값을 보는 eventual consistency(복구 가능), integrity 위반은 파생 데이터가 원본과 영구 불일치하는 corruption(저절로 낫지 않음)이다. 대부분 앱은 integrity를 훨씬 중시하며 ACID의 atomicity·durability가 이를 지킨다.",
+        },
+        {
+          type: "mcq",
+          q: "log 기반 시스템에서 uniqueness constraint(예: username 유일성)를 강제하는 방법은?",
+          options: [
+            "모든 노드에 동시에 물어보는 2PC만이 유일한 방법",
+            "충돌 가능한 연산들을 같은 파티션의 같은 로그로 라우팅해, 그 안의 total order로 '처음 claim한 자 승리'를 결정론적으로 판정한다",
+            "제약을 아예 강제하지 않는다",
+            "랜덤하게 하나를 고른다",
+          ],
+          answer: 1,
+          expl: "충돌 가능한 연산(같은 username claim)을 같은 파티션의 같은 로그로 라우팅하면 그 안의 total order로 '처음 claim한 자 승리, 나머지 거부'를 결정론적·linearizable하게 판정할 수 있다. multi-partition 제약은 여러 이벤트로 쪼개 idempotent 처리 + 필요 시 보상 트랜잭션으로 다룬다.",
+        },
+        {
+          type: "mcq",
+          q: "'trust, but verify'가 강조하는 바는?",
+          options: [
+            "저장소와 소프트웨어는 항상 옳으므로 검증이 불필요하다",
+            "하드웨어·소프트웨어는 조용히 데이터를 손상시킬 수 있으므로, 체크섬·재계산·감사로 무결성을 지속 검증해야 한다 — 데이터는 영원히 옳게 남지 않는다",
+            "백업만 있으면 검증은 필요 없다",
+            "검증은 최초 1회만 하면 된다",
+          ],
+          answer: 1,
+          expl: "하드웨어·소프트웨어는 silent corruption을 일으키고 데이터는 시간이 지나면 어디선가 썩는다. 그러므로 체크섬·재계산·주기적 감사로 무결성을 지속 검증해야 한다. 정확성은 한 번 확보하고 끝이 아니다.",
+        },
+        {
+          type: "ox",
+          q: "derived data(index, cache, materialized view, ML model)는 원본(system of record)으로부터 언제든 다시 만들 수 있으므로, 잃어버려도 재생성 가능하다.",
+          answer: true,
+          expl: "derived data는 원본을 변환해 만든 것이라 언제든 재생성 가능하다. 이것이 system of record와 구분되는 핵심 성질이며, 코드 버그 수정 후 로그를 다시 돌려 파생 데이터를 재생성하는 복구도 가능케 한다.",
+        },
+        {
+          type: "ox",
+          q: "대부분의 애플리케이션에서 integrity(무결성) 위반은 timeliness(적시성) 위반보다 대체로 덜 심각하다.",
+          answer: false,
+          expl: "반대다. integrity 위반(corruption, 저절로 낫지 않음)이 timeliness 위반(잠깐의 지연, 복구 가능)보다 대체로 훨씬 심각하며, 대부분 애플리케이션은 integrity를 더 중요하게 여긴다.",
+        },
+        {
+          type: "ox",
+          q: "'data is the new oil'이라는 비유는 데이터가 자산일 뿐 아니라, 유출·감시·오용의 위험물(toxic asset)이 될 수 있다는 양면을 함께 시사한다.",
+          answer: true,
+          expl: "'data is the new oil'은 데이터를 무한 축적할 자산으로만 보는 비유지만, 저자는 그 이면 — 축적된 개인정보는 유출·감시·오용의 위험물(toxic asset) — 을 강조한다. 모으지 않은 데이터는 새어 나갈 수 없다.",
+        },
+        {
+          type: "short",
+          q: "어떤 정확성 보장(예: 중복 없는 exactly-once 처리)은 통신 경로의 양 끝점에서만 완전히 구현될 수 있고 하위 계층의 부분 보장만으로는 불충분하다는, Saltzer·Reed·Clark의 논증 이름은?",
+          answers: [
+            "end-to-end argument",
+            "end to end argument",
+            "종단간 논증",
+            "엔드투엔드 논증",
+          ],
+          expl: "end-to-end argument (Saltzer, Reed, Clark) — 어떤 기능은 통신 경로의 양 끝점에서만 완전하고 올바르게 구현되며, 하위 계층의 부분 보장은 성능 최적화로는 유용해도 정확성을 완성하지 못한다.",
+        },
+        {
+          type: "short",
+          q: "예측 모델의 판정이 현실(행동·기록)을 바꾸고 그 바뀐 현실이 다시 모델의 예측을 강화하는 자기실현적 악순환을 부르는 용어는?",
+          answers: ["feedback loop", "피드백 루프", "피드백루프"],
+          expl: "feedback loop(피드백 루프) — 예측이 현실을 바꾸고 그 현실이 다시 예측을 강화하는 자기실현적 악순환. 예측 치안(predictive policing)이 대표적 예다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>

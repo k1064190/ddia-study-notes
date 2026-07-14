@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch10. Batch Processing — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+        <a href="ch07.html">Ch7</a>
+        <a href="ch08.html">Ch8</a>
+        <a href="ch09.html">Ch9</a>
+        <a href="ch10.html" class="active">Ch10</a>
+        <a href="ch11.html">Ch11</a>
+        <a href="ch12.html">Ch12</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch10. Batch Processing</h1>
+      <p class="subtitle">
+        1970년대 <strong>Unix 파이프라인의 철학</strong>(한 가지를 잘, 균일한
+        인터페이스로 조합, 불변 입력)에서 출발해 이를 수천 대로 확장한
+        <strong>MapReduce와 HDFS</strong>, 그리고 그 약점(중간 상태
+        materialization)을 넘어선
+        <strong>dataflow engine·그래프 처리·선언적 API</strong>까지
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        앞선 장들이 데이터를 <strong>어떻게 저장·일관 처리하는가</strong>였다면,
+        이 챕터부터는 데이터를
+        <strong>어떻게 다른 데이터로 변환하는가</strong>를 다룬다. Kleppmann은
+        시스템을 세 종류로 나눈다:
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>종류</th>
+            <th>성격</th>
+            <th>핵심 척도</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Service (online)</strong></td>
+            <td>요청을 받아 가능한 빨리 응답</td>
+            <td>response time · availability</td>
+          </tr>
+          <tr>
+            <td><strong>Batch (offline)</strong></td>
+            <td>대량 입력으로 작업을 돌려 출력 생성, 주기적 실행</td>
+            <td>throughput</td>
+          </tr>
+          <tr>
+            <td><strong>Stream (near-real-time)</strong></td>
+            <td>이벤트 발생 즉시 처리하되 파생 출력 생성</td>
+            <td>batch와 online의 중간 (11장)</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        이 챕터의 주인공은 <strong>batch processing</strong>이다. 그 사고방식의
+        뿌리는 1970년대 <strong>Unix 도구와 철학</strong>에 있으며, 그것을 분산
+        규모로 확장한 것이 <strong>MapReduce</strong>다 — 값싼 commodity 장비
+        위에서 Google 검색 색인 같은 작업을 무차별 대입으로 돌릴 수 있게 했다.
+      </p>
+      <blockquote>
+        챕터를 관통하는 핵심 사상은 <strong>입력의 불변성(immutability)</strong>
+        이다. 입력을 건드리지 않고 새 출력을 통째로 만들기에 batch 작업은
+        <strong>반복 실행 가능(repeatable)</strong>하고, 버그가 있어도 코드를
+        고쳐 다시 돌리면 되며(<strong>human fault tolerance</strong>), 롤백이
+        쉽다.
+      </blockquote>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>Batch Processing with Unix Tools — 사상의 원점</h3>
+      <p>
+        웹 서버 로그에서 "가장 많이 조회된 페이지 5개"를 뽑는 예 — 한 줄짜리
+        파이프라인으로 풀린다:
+      </p>
+      <blockquote>
+        <code
+          >cat access.log | awk '{print $7}' | sort | uniq -c | sort -rn | head
+          -n 5</code
+        >
+      </blockquote>
+      <p>각 단계가 한 가지 일만 하고 <strong>파이프(|)</strong>로 이어진다:</p>
+      <ul>
+        <li>
+          <strong>각 프로그램은 한 가지 일을 잘한다</strong>(do one thing well)
+          — 새 기능은 새 프로그램을 만들어 조합한다.
+        </li>
+        <li>
+          <strong>구성 가능성(composability)</strong>: 모든 프로그램의 출력이
+          다른 프로그램의 입력이 될 수 있다. 이를 가능케 하는
+          <strong>uniform interface</strong>는 파일(파일 디스크립터), 구체적으로
+          <strong>stdin/stdout으로 흐르는 text stream</strong>(줄바꿈으로 구분된
+          레코드)이다.
+        </li>
+        <li>
+          <strong>logic과 wiring의 분리</strong>: 프로그램은 자기 로직만 담고,
+          입력이 어디서 오고 출력이 어디로 가는지는 shell이 결정한다.
+        </li>
+        <li>
+          <code>sort</code>는 메모리보다 큰 데이터도 디스크로 spill하고 여러
+          CPU로 병렬 정렬한다 — 이미 "메모리에 안 들어가는 데이터"를 다룬다.
+        </li>
+        <li>
+          <strong>입력의 불변성</strong>: 파이프라인은 입력 파일을 결코 수정하지
+          않는다 — 옵션을 바꿔 몇 번이고 다시 돌려도 안전하고 중간 결과를
+          들여다보며 자유롭게 실험·디버깅할 수 있다.
+        </li>
+      </ul>
+      <div class="callout">
+        <strong>심층 설명</strong> — Unix 철학과 MapReduce의 공통점 = 균일한
+        인터페이스: Unix가 프로그램을 레고처럼 이어 붙일 수 있는 비결은
+        <em>단순하고 느슨한 공통 인터페이스</em>다 — 모두가 stdin으로 읽고
+        stdout으로 쓰는 <strong>text stream</strong> 하나로 통일돼 있어, 어떤
+        프로그램의 출력이든 다른 프로그램의 입력이 된다. MapReduce도 정확히 같은
+        발상을 <em>분산 규모</em>로 옮긴 것이다: Unix의 stdin/stdout 자리에
+        <strong>분산 파일시스템(HDFS)의 파일</strong>이 들어선다. mapper는
+        파일을 읽어 key-value를 쓰고, reducer는 그 결과를 읽어 또 파일을 쓴다.
+        각 작업이 HDFS 위 불변 파일이라는 균일한 인터페이스로 소통하기에, 서로
+        다른 팀이 만든 작업들을 파이프라인처럼 엮을 수 있다. 차이는
+        <em>규모와 실행 위치</em>
+        뿐 — Unix는 단일 머신의 파이프, MapReduce는 수천 대에 흩어진 파일. 이
+        "logic(각 프로그램)과 wiring(연결)의 분리" + "불변 입력" 조합이 두
+        시스템이 공유하는 유전자다.
+      </div>
+
+      <h3>MapReduce와 분산 파일시스템</h3>
+      <p>
+        MapReduce는 Unix 파이프라인과 닮았지만
+        <strong>수천 대 장비에 분산</strong>된다. uniform interface는
+        stdin/stdout 대신 분산 파일시스템 위의 파일이다.
+      </p>
+      <p>
+        <strong>HDFS (Hadoop Distributed File System)</strong>:
+        <strong>shared-nothing</strong> 원칙으로 특별한 하드웨어 없이 일반
+        데이터센터의 <strong>commodity 디스크</strong>들을 네트워크로 묶는다. 각
+        장비의 <strong>DataNode</strong> 데몬과, 어떤 블록이 어느 장비에 있는지
+        추적하는 중앙 <strong>NameNode</strong>로 구성되며, 파일은 여러 장비에
+        복제·분산돼 장비가 죽어도 살아남는다. 전용 하드웨어로 공유 저장소를
+        제공하는 비싼 <strong>NAS/SAN</strong>과 대조적으로, 값싼 장비를 그냥
+        늘려(scale out) 페타바이트급으로 키운다.
+      </p>
+      <p><strong>MapReduce 작업의 실행</strong>:</p>
+      <ul>
+        <li>입력 파일을 레코드 단위로 쪼갠다.</li>
+        <li>
+          <strong>Mapper</strong>: 각 입력 레코드마다 호출돼 임의 개수의
+          key-value 쌍을 방출한다. 레코드 간 상태를 유지하지 않는다.
+        </li>
+        <li>
+          <strong>(프레임워크) 정렬</strong>: 방출된 모든 key-value를 key로
+          정렬한다.
+        </li>
+        <li>
+          <strong>Reducer</strong>: 같은 key의 값들을 모아 호출돼 출력을 만든다.
+        </li>
+      </ul>
+      <ul>
+        <li>
+          핵심은 mapper와 reducer 사이의 정렬·재분배 단계 =
+          <strong>shuffle</strong>이다 — mapper 출력을 key로 partition·정렬해
+          같은 key의 레코드가 <strong>같은 reducer</strong>로 모이게 한다.
+        </li>
+        <li>
+          <strong>map-side data locality</strong>: mapper는 가급적 입력 블록이
+          저장된 장비에서 실행된다. 큰 입력을 옮기는 대신 코드(수 KB의 JAR)를
+          데이터가 있는 곳으로 보낸다 — "putting the computation near the data".
+        </li>
+      </ul>
+      <p>
+        <strong>MapReduce workflows</strong>: 현실 문제는 여러 작업을
+        <strong>체인</strong>으로 엮어 푼다 — 앞 작업의 출력 디렉터리가 다음
+        작업의 입력이 된다. MapReduce 자체엔 workflow 개념이 없어, 작업
+        <strong>의존성</strong>을 관리(성공 후 다음 실행)하는
+        <strong>workflow scheduler</strong>(Oozie, Airflow, Luigi, Azkaban 등)가
+        필요하다.
+      </p>
+
+      <p><strong>Reduce-side joins와 grouping</strong>:</p>
+      <ul>
+        <li>
+          MapReduce엔 인덱스가 없어 join은 보통 양쪽 데이터셋 전체를 훑는다.
+        </li>
+        <li>
+          <strong>Sort-merge join</strong>: 두 데이터셋(활동 로그 + 사용자
+          프로필)을 각각 <strong>join key(user ID)로 방출</strong>하면
+          프레임워크가 key로 정렬해, 같은 user ID의 레코드가
+          <strong>reducer에 나란히</strong> 모인다 — reducer가 이 "관련 레코드
+          모으기"로 join한다. <strong>secondary sort</strong>로 프로필을
+          활동보다 먼저 오게 하면 깔끔하다.
+        </li>
+        <li>
+          <strong>Group-by</strong>도 같은 구조 — grouping key로 방출하면 같은
+          그룹이 한 reducer로 모인다.
+        </li>
+        <li>
+          <strong>Skew(hot key)</strong>: 특정 key에 레코드가 몰리면 그 reducer
+          하나가 전체를 지연시킨다(straggler). 대응 —
+          <strong>skewed/sharded join</strong>(hot key를 여러 reducer로 분산,
+          상대 레코드는 복제), <strong>map-side aggregation(combiner)</strong>
+          (reducer 전에 mapper 쪽 부분 집계로 전송량 감소).
+        </li>
+      </ul>
+
+      <div class="callout">
+        <strong>심층 설명</strong> — reduce-side sort-merge join과 shuffle:
+        MapReduce에는 랜덤 액세스 인덱스가 없어서 join을 "한쪽을 인덱스로
+        찾아보기" 로 할 수 없다. 대신 <strong>정렬의 힘</strong>을 빌린다. 활동
+        로그의 모든 레코드와 프로필 DB의 모든 레코드를 각각 mapper로 읽되,
+        <em>둘 다 user ID를 key로</em> 방출한다. 그러면 프레임워크의
+        <strong>shuffle</strong>이 마법을 부린다 — 모든 방출 레코드를 key로
+        partition·정렬해
+        <em
+          >같은 user ID를 가진 레코드들(활동이든 프로필이든)이 하나의 reducer에,
+          그것도 인접해서</em
+        >
+        도착하게 만든다. reducer는 그저 연속으로 들어오는 같은 key의 레코드들을
+        병합(merge)하면 된다 — 이것이 sort-merge join이다. secondary sort를 걸어
+        각 user ID에서 <em>프로필 레코드가 활동 레코드보다 먼저</em> 오게 하면,
+        reducer는 프로필을 변수에 담아두고 뒤따르는 활동들에 갖다 붙이기만 하면
+        된다. 즉 join의 본질은 "<strong
+          >관련 레코드를 물리적으로 한자리에 모으는 것</strong
+        >"이고, 그 "모으기"를 담당하는 것이 정렬 기반 shuffle이다. 인덱스 없이
+        오직 정렬로 조인을 해내는 것 — 이것이 batch join의 정수다.
+      </div>
+
+      <p><strong>Map-side joins</strong> (정렬·shuffle 비용을 없애는 경우):</p>
+      <table>
+        <thead>
+          <tr>
+            <th>방식</th>
+            <th>적용 조건</th>
+            <th>동작</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Broadcast hash join</strong></td>
+            <td>한쪽이 작아 메모리에 들어감</td>
+            <td>
+              작은 쪽을 해시테이블로 만들어 모든 mapper에 broadcast, 각 mapper가
+              큰 쪽을 훑으며 조회
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Partitioned hash join</strong></td>
+            <td>두 입력이 같은 방식·같은 개수로 partition됨</td>
+            <td>대응 partition끼리만 join — 각 mapper가 자기 몫만 메모리에</td>
+          </tr>
+          <tr>
+            <td><strong>Map-side merge join</strong></td>
+            <td>같은 key로 partition + 정렬까지 됨</td>
+            <td>reduce-side와 같은 병합을 map 단계에서 바로 수행</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p>
+        <strong>Batch workflow의 출력</strong>: 검색 색인(search index)이나
+        배치성 key-value store를 만든다. 철학은
+        <strong
+          >불변 파일을 통째로 새로 만들어 놓고(build offline) 서비스가
+          로드</strong
+        >하는 것 — 라이브 DB에 레코드를 하나씩 쓰지 않는다. 그래서:
+      </p>
+      <ul>
+        <li>
+          <strong>repeatable</strong> — 버그가 있어도 고쳐 다시 돌리면 된다.
+        </li>
+        <li>
+          <strong>human fault tolerance</strong> — 잘못된 출력도 이전 출력으로
+          쉽게 롤백된다(되돌릴 수 없는 DB 변경과 대조). 코드 실수의 영향을
+          최소화한다.
+        </li>
+        <li>부분 실패한 출력은 버리고 재시도하면 되므로 원자성 걱정이 적다.</li>
+      </ul>
+
+      <h3>Beyond MapReduce — MapReduce를 넘어서</h3>
+      <p>
+        <strong>MapReduce의 약점 — 중간 상태의 materialization</strong>: 여러
+        작업을 체인으로 엮을 때 각 작업 출력은 분산 FS에
+        <strong>완전히 기록(fully materialize)</strong>되어야 다음 작업이
+        읽는다. 문제 — ① 다음 작업은 앞 작업이
+        <strong>완전히 끝날 때까지 대기</strong> (straggler 하나가 전체를 지연),
+        ② reducer 출력을 다음 mapper가 그대로 다시 읽는
+        <strong>중복 mapper</strong>, ③ 임시 데이터를 복제하는 과한 비용. (Unix
+        파이프는 반대로 중간 결과를 파일로 떨구지 않고 스트리밍한다.)
+      </p>
+      <p>
+        <strong>Dataflow engines (Spark, Tez, Flink)</strong>: rigid한
+        map→reduce 2단계 대신 작업 전체를 <strong>operator 그래프</strong>로
+        표현해 한 번에 실행한다. 불필요한 정렬·materialization을 건너뛰고,
+        <strong>pipelined execution</strong>으로 한 operator의 출력을 디스크에
+        떨구지 않고 다음으로 바로 흘려보낸다. fault tolerance는 중간 상태 복제
+        대신 <strong>재계산</strong>으로 — Spark는 데이터의 생성 계보 (<strong
+          >RDD lineage</strong
+        >)를 추적해 잃은 partition만 입력부터 다시 계산한다(operator가
+        <strong>deterministic</strong>이어야 함).
+      </p>
+      <div class="callout">
+        <strong>심층 설명</strong> — dataflow engine이 MapReduce보다 빠른 이유 =
+        중간 상태 materialization 회피: MapReduce 파이프라인의 진짜 병목은
+        계산이 아니라 <em>작업 사이마다 분산 파일시스템을 왕복하는 것</em>이다.
+        작업 A의 reducer 출력이 HDFS에 <strong>전부 기록</strong>되고(게다가
+        복제까지 돼), 작업 B의 mapper가 그것을
+        <strong>전부 다시 읽어</strong> 시작한다. 이 디스크·네트워크 왕복이
+        반복될수록 비용이 쌓인다. 게다가 B는 A가 마지막 레코드까지 다 끝내야
+        시작할 수 있어, A의
+        <strong>straggler 하나가 전체 파이프라인을 멈춰 세운다</strong>.
+        Dataflow engine은 이 중간 저장 단계를 없앤다 — 작업 전체를 operator
+        그래프로 보고, 한 operator의 결과를 디스크에 내려놓지 않고
+        <strong>메모리에서 다음 operator로 곧장 흘려보낸다 (pipelined)</strong>.
+        또 MapReduce가 매 단계 강제하던 정렬도
+        <em>정말 필요한 곳에서만</em> 한다. 대신 중간 상태를 복제해 두지 않으니
+        노드가 죽으면 데이터를 잃는데, 이를
+        <strong>lineage 기반 재계산</strong>으로 메운다 — "이 partition은 이런
+        연산들로 만들어졌다"는 계보만 있으면 잃은 조각을 입력부터 다시 만들면
+        된다(그래서 operator가 deterministic이어야 한다). 요컨대:
+        <em
+          >디스크 materialization을 메모리 pipelining으로, 복제 기반 내결함성을
+          재계산 기반 내결함성으로</em
+        >
+        바꾼 것이 속도의 핵심이다.
+      </div>
+      <p>
+        <strong>Graph processing — Pregel / BSP</strong>: PageRank처럼 그래프를
+        <strong>반복(iterative)</strong> 훑는 알고리즘은 MapReduce와 안
+        맞는다(매 iteration마다 전체 재실행).
+        <strong>Pregel 모델(= bulk synchronous parallel, BSP)</strong>에서는 각
+        정점(vertex)이 매 iteration (<strong>superstep</strong>)마다 다른 정점에
+        <strong>메시지를 보내고</strong>, 다음 superstep에서 받은 메시지로
+        상태를 갱신한다. 정점 상태는 iteration 사이에 메모리에 유지돼 매번
+        재읽기가 없고, superstep 경계의 <strong>checkpoint</strong>로 fault
+        tolerance를 얻는다.
+      </p>
+      <p>
+        <strong>고수준 API와 선언적 질의 최적화</strong>: MapReduce 손코딩은
+        장황하다. <strong>Hive</strong>(SQL 유사), <strong>Pig</strong>,
+        <strong>Spark SQL/DataFrame</strong> 등이 흔한 패턴을 짧게 표현하면
+        엔진이 MapReduce/dataflow 작업으로 컴파일한다.
+        <strong>declarative로의 이동</strong> — 무엇을(어떤 join) 원하는지만
+        적으면 옵티마이저가
+        <strong>실행 전략(broadcast hash join vs sort-merge join 등)</strong>을
+        자동 선택한다(관계형 옵티마이저와 같은 발상). 또
+        <strong>vectorized execution</strong>으로 레코드를 한 건씩이 아니라
+        묶음으로 CPU 캐시·SIMD 친화적으로 처리해 처리량을 끌어올린다.
+      </p>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Unix 파이프 — 컨베이어 벨트 위의 전문 일꾼들</h3>
+        <p>
+          각 일꾼(프로그램)은 딱 한 가지 작업만 완벽히 하고 결과물을 옆 벨트로
+          넘긴다. 벨트 규격(<strong>text stream</strong>)이 표준이라 누구 옆에
+          누구를 세워도 맞물린다. 새 기능은 기존 일꾼 개조가 아니라 새 일꾼을
+          줄에 끼워 넣어 얻는다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>불변 입력 — 원본을 손대지 않는 레시피 실험</h3>
+        <p>
+          재료(입력 파일)를 그대로 두고 요리를 새로 만들어 접시에 담는다. 맛이
+          이상하면 재료는 멀쩡하니 레시피만 고쳐 다시 만들면 된다. 재료 자체를
+          태워 없앴다면(가변 DB) 돌이킬 수 없다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>HDFS — 도서관 분관 네트워크 vs 초대형 금고(NAS/SAN)</h3>
+        <p>
+          비싼 중앙 금고 하나 대신, 동네 도서관(commodity 장비)마다 책 사본을
+          나눠 두고 어느 책이 어느 분관에 있는지 적은 대장(NameNode)을 둔다.
+          분관 하나가 불타도 다른 곳에 사본이 있다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Data locality — 문서를 옮기지 말고 직원을 보내라</h3>
+        <p>
+          100GB 서류를 본사로 실어 오는 대신, 그 서류가 있는 창고로 작은 도장
+          (코드)을 든 직원을 파견한다. 옮기는 것은 데이터가 아니라 계산이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Sort-merge join — 정렬된 두 명단 나란히 맞추기</h3>
+        <p>
+          "출석부"와 "성적표"를 각각 학번 순으로 정렬해 나란히 놓고 위에서부터
+          내려오면 같은 학번끼리 자연히 만나 짝지어진다. reducer가 하는 일이
+          바로 이 "같은 key를 한자리에 모으기"다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Hot key skew — 한 창구에만 늘어선 줄</h3>
+        <p>
+          유명인 계정 하나 때문에 특정 reducer 창구에 손님이 몰리면 그 줄만
+          끝없이 길어진다. 해결: 인기 손님을 여러 창구로 나눠 보내고(sharded
+          join), 짝이 될 상대 서류는 각 창구에 복사해 둔다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Broadcast hash join — 작은 전화번호부를 모두에게</h3>
+        <p>
+          큰 주문 목록을 나눠 맡은 직원들에게 작은 "고객 전화번호부"를 통째로
+          복사해 쥐여 준다. 각자 자기 주문을 보며 번호부에서 즉석 조회하면 되니
+          따로 모을(shuffle) 필요가 없다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Materialization — 매 공정마다 창고에 다 쌓고 세는 공장</h3>
+        <p>
+          공정 A가 물건을 <strong>전부</strong> 만들어 창고에 쌓아야 공정 B가
+          시작한다. A의 마지막 한 개가 늦으면 B 전체가 대기한다. Dataflow
+          engine은 컨베이어처럼 만들어지는 대로 다음 공정으로 흘려보내 창고
+          왕복을 없앤다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>RDD lineage — 요리 과정을 적어둔 노트</h3>
+        <p>
+          중간 결과를 냉장고에 백업(복제)하는 대신 "이 소스는 A를 볶고 B를 넣어
+          만들었다"는 조리 노트만 남긴다. 접시를 엎으면 노트를 보고 그 단계만
+          다시 만든다 — 단, 매번 같은 맛이 나오려면 레시피가 결정적이어야 한다
+          (deterministic).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Pregel/BSP — 라운드제 쪽지 교환</h3>
+        <p>
+          각 사람(정점)이 매 라운드(superstep)에 이웃에게 쪽지(메시지)를 보내고,
+          다음 라운드에 받은 쪽지로 자기 숫자를 고친다. 모두가 라운드 종을
+          기다렸다 동시에 다음 라운드로 넘어간다(동기적).
+        </p>
+      </div>
+      <div class="card">
+        <h3>선언적 API — 목적지만 말하는 택시</h3>
+        <p>
+          "sort-merge로 조인해"라고 운전 방법을 지시하는 대신 "이 둘을 user ID로
+          붙여줘"라고 목적지만 말하면, 옵티마이저(기사)가 길(join 전략)을 알아서
+          고른다.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Service / Batch / Stream</strong></td>
+            <td>
+              online(response time·availability) / offline(throughput) /
+              near-real-time(그 중간, 파생 출력)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Unix philosophy</strong></td>
+            <td>각 프로그램은 한 가지를 잘, 출력이 다른 입력이 되게, 조합</td>
+          </tr>
+          <tr>
+            <td><strong>Uniform interface</strong></td>
+            <td>
+              프로그램 간 공통 인터페이스 = 파일/stdin·stdout의 text stream
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Immutability of inputs</strong></td>
+            <td>입력 미수정 → 반복 실행·디버깅·롤백 가능</td>
+          </tr>
+          <tr>
+            <td><strong>HDFS</strong></td>
+            <td>
+              shared-nothing 분산 FS — commodity 디스크 + DataNode + 중앙
+              NameNode
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Shared-nothing</strong></td>
+            <td>특수 하드웨어 없이 일반 장비를 묶어 scale out</td>
+          </tr>
+          <tr>
+            <td><strong>NameNode</strong></td>
+            <td>
+              어떤 블록이 어느 장비에 있는지 추적하는 중앙 메타데이터 노드
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Mapper / Reducer</strong></td>
+            <td>
+              레코드마다 key-value 방출(상태 없음) / 같은 key의 값들을 모아 처리
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Shuffle</strong></td>
+            <td>
+              mapper 출력을 key로 partition·정렬해 같은 key를 같은 reducer로
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Data locality</strong></td>
+            <td>
+              mapper를 입력 블록이 있는 장비에서 실행 — 계산을 데이터 가까이로
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Workflow scheduler</strong></td>
+            <td>작업 의존성 관리(성공 후 다음) — Oozie, Airflow, Luigi</td>
+          </tr>
+          <tr>
+            <td><strong>Sort-merge join</strong></td>
+            <td>
+              join key로 방출·정렬해 reducer에서 관련 레코드를 나란히 모아 join
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Skew / hot key</strong></td>
+            <td>특정 key에 몰려 한 reducer가 지연(straggler)</td>
+          </tr>
+          <tr>
+            <td><strong>Sharded join / combiner</strong></td>
+            <td>
+              hot key를 여러 reducer로 분산·복제 / mapper 쪽 부분 집계로 전송량
+              감소
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Broadcast hash join</strong></td>
+            <td>
+              작은 쪽을 해시테이블로 모든 mapper에 broadcast — map 단계 join
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Partitioned / map-side merge join</strong></td>
+            <td>
+              같은 방식 partition끼리 join / partition+정렬 시 map 단계 병합
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Batch 출력 철학</strong></td>
+            <td>
+              불변 입력 → 통째로 새 출력 → repeatable·human fault tolerance·롤백
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Materialization</strong></td>
+            <td>
+              작업 출력을 분산 FS에 완전히 기록 — MapReduce 약점(대기·중복
+              mapper)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Dataflow engine</strong></td>
+            <td>
+              operator 그래프 실행 — 불필요한 정렬·materialization 회피,
+              pipelined (Spark/Tez/Flink)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>RDD lineage</strong></td>
+            <td>데이터 생성 계보 — Spark의 재계산 기반 fault tolerance</td>
+          </tr>
+          <tr>
+            <td><strong>Deterministic operator</strong></td>
+            <td>같은 입력 → 같은 출력 — 재계산 fault tolerance의 전제</td>
+          </tr>
+          <tr>
+            <td><strong>Pregel / BSP / Superstep</strong></td>
+            <td>
+              정점이 매 iteration(superstep) 메시지를 주고받는 반복 그래프 처리
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Declarative query optimization</strong></td>
+            <td>
+              무엇을(join)만 적으면 옵티마이저가 전략 선택 (Hive, Pig, Spark
+              SQL)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Vectorized execution</strong></td>
+            <td>
+              레코드를 묶음으로 CPU 캐시·SIMD 친화적 처리 — throughput 향상
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        Batch processing의 사상은
+        <strong>불변 입력 → 통째로 새 출력</strong>이라는 Unix 파이프라인
+        철학(한 가지를 잘, 균일한 인터페이스로 조합)에서 출발해, 이를
+        <strong>HDFS + MapReduce</strong>로 수천 대에 확장하고(shuffle로
+        sort-merge join·group-by, 작은 쪽은 broadcast hash join, 계산은 데이터
+        가까이), 중간 상태를 매번 <strong>materialize</strong>해야 하는
+        MapReduce의 비효율은 <strong>dataflow engine</strong>(Spark/Tez/Flink —
+        pipelined 실행 + lineage 재계산), <strong>Pregel/BSP</strong> 그래프
+        처리, 그리고 <strong>선언적 고수준 API</strong>(Hive/Pig/Spark SQL)가
+        극복한다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch09.html">← Ch9. Consistency and Consensus</a
+        ><a href="ch11.html">Ch11. Stream Processing →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "세 종류 시스템의 척도 대응으로 옳은 것은?",
+          options: [
+            "service는 throughput, batch는 response time",
+            "service는 response time·availability, batch는 throughput, stream은 그 중간",
+            "세 시스템 모두 동일하게 response time으로 평가한다",
+            "batch는 near-real-time이고 stream은 offline이다",
+          ],
+          answer: 1,
+          expl: "service(online)는 response time·availability, batch(offline)는 throughput, stream은 이벤트 즉시 처리하되 파생 출력을 만드는 batch와 online의 중간이다.",
+        },
+        {
+          type: "mcq",
+          q: "Unix 철학에서 프로그램 간 조합을 가능하게 하는 'uniform interface'의 핵심은?",
+          options: [
+            "공유 메모리 세그먼트",
+            "stdin/stdout으로 흐르는 text stream(줄바꿈으로 구분된 레코드) 같은 파일 인터페이스",
+            "각 프로그램 전용의 바이너리 RPC 프로토콜",
+            "중앙 메시지 브로커",
+          ],
+          answer: 1,
+          expl: "Unix의 uniform interface는 파일(파일 디스크립터), 구체적으로 stdin/stdout을 흐르는 줄바꿈 구분 text stream이다. 이 단순한 규격 덕에 임의 프로그램을 레고처럼 조합한다.",
+        },
+        {
+          type: "mcq",
+          q: "'... | sort | uniq -c | sort -rn | head' 파이프라인이 보여주는 Unix 철학이 아닌 것은?",
+          options: [
+            "각 프로그램은 한 가지 일을 잘한다",
+            "출력이 다른 프로그램의 입력이 될 수 있다 (composability)",
+            "logic과 wiring(입출력 연결)의 분리",
+            "모든 프로그램이 하나의 거대한 단일 실행 파일로 통합돼야 한다",
+          ],
+          answer: 3,
+          expl: "Unix 철학은 정반대다 — 거대한 단일 실행 파일이 아니라 작은 프로그램들을 조합한다. 나머지 셋은 모두 파이프라인이 예시하는 철학이다.",
+        },
+        {
+          type: "mcq",
+          q: "HDFS의 설계 원칙으로 옳은 것은?",
+          options: [
+            "전용 고가 하드웨어(NAS/SAN)를 요구한다",
+            "shared-nothing — commodity 장비의 일반 디스크를 묶고, 블록 위치는 중앙 NameNode가 추적한다",
+            "데이터를 단일 장비에만 저장한다",
+            "파일을 복제하지 않아 장비 장애 시 데이터가 사라진다",
+          ],
+          answer: 1,
+          expl: "HDFS는 shared-nothing으로 commodity 디스크를 묶고, DataNode들이 블록을 복제 저장하며 중앙 NameNode가 블록 위치를 추적한다. 전용 하드웨어 기반 NAS/SAN의 값싼 대안이다.",
+        },
+        {
+          type: "mcq",
+          q: "MapReduce에서 mapper와 reducer 사이의 'shuffle' 단계가 하는 일은?",
+          options: [
+            "데이터를 무작위로 섞어 보안을 강화한다",
+            "mapper 출력을 key로 partition·정렬해 같은 key의 레코드를 같은 reducer로 모은다",
+            "reducer 출력을 다시 mapper로 되돌린다",
+            "입력 파일을 압축한다",
+          ],
+          answer: 1,
+          expl: "shuffle은 mapper 출력을 key로 partition·정렬해 같은 key의 레코드를 같은 reducer로 모으는 재분배 단계다. join·group-by가 여기서 성립한다.",
+        },
+        {
+          type: "mcq",
+          q: "'putting the computation near the data'(map-side data locality)의 의미는?",
+          options: [
+            "모든 입력을 중앙 노드로 모아 처리한다",
+            "큰 입력을 옮기는 대신, mapper 코드를 입력 블록이 저장된 장비에서 실행한다",
+            "reducer를 클라이언트 근처에 배치한다",
+            "데이터를 항상 메모리에만 둔다",
+          ],
+          answer: 1,
+          expl: "큰 입력을 네트워크로 옮기는 대신 작은 코드(JAR)를 데이터가 있는 장비로 보내 mapper를 그곳에서 실행한다 — 계산을 데이터 가까이로.",
+        },
+        {
+          type: "mcq",
+          q: "MapReduce workflow에서 Oozie·Airflow·Luigi 같은 도구의 역할은?",
+          options: [
+            "데이터를 암호화한다",
+            "작업 간 의존성을 관리해, 앞 작업이 성공적으로 끝난 뒤에만 다음 작업을 실행한다",
+            "mapper 개수를 자동으로 0으로 만든다",
+            "HDFS를 대체하는 저장소다",
+          ],
+          answer: 1,
+          expl: "MapReduce엔 workflow 개념이 없어, 작업 의존성을 관리해 앞 작업이 성공한 뒤에만 다음을 실행하는 workflow scheduler(Oozie, Airflow, Luigi 등)가 필요하다.",
+        },
+        {
+          type: "mcq",
+          q: "reduce-side sort-merge join의 동작으로 옳은 것은?",
+          options: [
+            "한쪽을 메모리에 올려 해시 조회한다",
+            "양쪽을 join key로 방출하면 프레임워크가 key로 정렬해, 같은 key의 관련 레코드가 reducer에 나란히 모여 join된다",
+            "인덱스를 사용해 랜덤 액세스로 join한다",
+            "정렬 없이 mapper에서 즉시 완료된다",
+          ],
+          answer: 1,
+          expl: "양쪽을 join key로 방출하면 프레임워크가 key로 정렬해 같은 key의 활동·프로필 레코드가 reducer에 나란히 모인다. reducer는 이 '관련 레코드 모으기'로 join한다. 인덱스·랜덤 액세스는 쓰지 않는다.",
+        },
+        {
+          type: "mcq",
+          q: "hot key로 인한 skew(straggler) 문제의 대응책이 아닌 것은?",
+          options: [
+            "skewed/sharded join으로 hot key를 여러 reducer에 분산하고 상대 레코드를 복제",
+            "map-side aggregation(combiner)으로 전송량을 줄임",
+            "모든 레코드를 반드시 단일 reducer로 몰아 처리",
+            "인기 key를 감지해 특별 처리",
+          ],
+          answer: 2,
+          expl: "모든 레코드를 단일 reducer로 몰면 skew가 악화된다. 올바른 대응은 sharded/skewed join(분산+복제)과 map-side aggregation(combiner)이다.",
+        },
+        {
+          type: "mcq",
+          q: "broadcast hash join이 적용 가능한 조건은?",
+          options: [
+            "두 데이터셋이 모두 매우 클 때",
+            "한쪽 데이터셋이 작아 메모리에 들어갈 때 — 이를 해시테이블로 모든 mapper에 broadcast",
+            "두 입력이 서로 다른 방식으로 partition됐을 때",
+            "reducer가 반드시 필요할 때",
+          ],
+          answer: 1,
+          expl: "한쪽이 메모리에 들어갈 만큼 작을 때, 그것을 해시테이블로 만들어 모든 mapper에 broadcast하고 각 mapper가 큰 쪽을 훑으며 조회한다 — shuffle 불필요.",
+        },
+        {
+          type: "mcq",
+          q: "partitioned hash join(bucketed map join)이 성립하는 조건은?",
+          options: [
+            "두 입력이 같은 방식으로 같은 개수의 partition으로 나뉘어, 대응 partition끼리만 join하면 될 때",
+            "데이터가 정렬돼 있지 않아야 할 때",
+            "한쪽이 비어 있을 때",
+            "입력이 단일 파일일 때",
+          ],
+          answer: 0,
+          expl: "두 입력이 같은 방식·같은 개수로 partition돼 있으면, 대응 partition끼리만 join하면 되므로 각 mapper가 자기 partition만 메모리에 올려 처리한다.",
+        },
+        {
+          type: "mcq",
+          q: "batch workflow 출력 철학(불변 입력 → 통째로 새 출력)의 장점이 아닌 것은?",
+          options: [
+            "코드 버그가 있어도 고쳐 다시 돌릴 수 있다(repeatable)",
+            "잘못된 출력을 이전 출력으로 쉽게 롤백(human fault tolerance)",
+            "출력이 항상 라이브 DB에 레코드 단위로 즉시 반영된다",
+            "부분 실패한 작업 출력은 버리고 재시도하면 된다",
+          ],
+          answer: 2,
+          expl: "batch 출력은 라이브 DB에 즉시 레코드 단위로 쓰는 것이 아니라 불변 파일을 통째로 새로 만들어 로드한다. 나머지는 모두 이 철학의 장점(repeatable, 롤백, 재시도 용이)이다.",
+        },
+        {
+          type: "mcq",
+          q: "MapReduce의 주요 약점으로 dataflow engine이 극복한 것은?",
+          options: [
+            "데이터를 전혀 정렬하지 못하는 점",
+            "각 작업의 중간 상태를 분산 FS에 완전히 materialize해야 해, 다음 작업이 앞 작업 완료를 기다리고 mapper가 중복되는 점",
+            "key-value 개념이 없는 점",
+            "단일 머신에서만 도는 점",
+          ],
+          answer: 1,
+          expl: "MapReduce는 각 작업 출력을 분산 FS에 fully materialize해야 해서 다음 작업이 앞 작업 완료를 기다리고(straggler 전파), reducer 출력을 다음 mapper가 다시 읽는 중복이 생긴다. dataflow engine은 pipelined 실행으로 이를 없앤다.",
+        },
+        {
+          type: "mcq",
+          q: "Spark 같은 dataflow engine이 노드 장애를 복구하는 방식은?",
+          options: [
+            "모든 중간 상태를 3중 복제해 둔다",
+            "RDD lineage(계보)로 잃은 partition을 입력부터 재계산한다 — operator가 deterministic이어야 한다",
+            "작업을 처음부터 전부 다시 돌린다",
+            "장애를 무시하고 부분 결과를 반환한다",
+          ],
+          answer: 1,
+          expl: "중간 상태를 복제하지 않는 대신 RDD lineage로 데이터 생성 계보를 추적해 잃은 partition만 입력부터 재계산한다. 재계산이 같은 결과를 내려면 operator가 deterministic이어야 한다.",
+        },
+        {
+          type: "mcq",
+          q: "Pregel(BSP) 그래프 처리 모델의 특징은?",
+          options: [
+            "매 iteration마다 전체 데이터를 디스크에서 다시 읽는다",
+            "각 정점이 superstep마다 다른 정점에 메시지를 보내고, 정점 상태를 iteration 간 유지하며, checkpoint로 fault tolerance를 얻는다",
+            "정점 간 통신이 전혀 없다",
+            "반복 없는 단일 pass만 지원한다",
+          ],
+          answer: 1,
+          expl: "Pregel/BSP는 정점이 superstep마다 메시지를 주고받고 상태를 iteration 간 메모리에 유지하며(매번 재읽기 없음), superstep 경계 checkpoint로 장애를 복구한다.",
+        },
+        {
+          type: "ox",
+          q: "Unix 파이프라인은 입력 파일을 수정하지 않으므로, 옵션을 바꿔 몇 번이고 안전하게 다시 실행하고 중간 결과를 살펴보며 디버깅할 수 있다.",
+          answer: true,
+          expl: "입력 불변성 덕에 반복 실행이 안전하고, less 등으로 중간 결과를 살펴보며 자유롭게 실험·디버깅할 수 있다.",
+        },
+        {
+          type: "ox",
+          q: "MapReduce는 각 작업의 출력을 분산 파일시스템에 완전히 기록하지 않고, Unix 파이프처럼 중간 결과를 스트리밍으로 다음 작업에 곧바로 흘려보낸다.",
+          answer: false,
+          expl: "반대다. MapReduce는 각 작업 출력을 분산 FS에 완전히 materialize하며 스트리밍하지 않는다. 그 스트리밍(pipelined) 장점은 dataflow engine의 특징이다.",
+        },
+        {
+          type: "ox",
+          q: "Hive, Pig, Spark SQL 같은 선언적 고수준 API에서는 사용자가 join 알고리즘을 명시하지 않아도 옵티마이저가 broadcast hash join·sort-merge join 등 실행 전략을 자동으로 선택할 수 있다.",
+          answer: true,
+          expl: "선언적 API는 '무엇을'만 표현하고, 옵티마이저가 join 전략(broadcast hash vs sort-merge 등)을 자동 선택한다 — 관계형 옵티마이저와 같은 발상.",
+        },
+        {
+          type: "short",
+          q: "작은 데이터셋을 해시테이블로 만들어 모든 mapper에 통째로 나눠주고, 각 mapper가 큰 데이터셋을 훑으며 조회함으로써 reducer/shuffle 없이 map 단계에서 끝내는 join 방식의 이름은?",
+          answers: ["broadcast hash join", "broadcast join"],
+          expl: "Broadcast hash join — 작은 쪽을 해시테이블로 모든 mapper에 broadcast해 map 단계에서 join을 끝낸다(shuffle 불필요).",
+        },
+        {
+          type: "short",
+          q: "Spark가 노드 장애 시 잃어버린 partition을 재계산할 수 있도록, 데이터가 어떤 연산들로 만들어졌는지를 추적하는 계보 정보의 이름은? (약어 포함)",
+          answers: ["rdd lineage", "lineage", "rdd 계보"],
+          expl: "RDD lineage(계보) — 데이터가 어떤 연산들로 만들어졌는지 추적하는 정보로, Spark는 이를 이용해 잃어버린 partition을 입력부터 재계산한다(operator가 deterministic이어야 함).",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>

@@ -1,0 +1,904 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ch11. Stream Processing — DDIA 학습 노트</title>
+    <link rel="stylesheet" href="assets/style.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="index.html">📚 DDIA 학습 노트</a>
+      <nav>
+        <a href="ch01.html">Ch1</a>
+        <a href="ch02.html">Ch2</a>
+        <a href="ch03.html">Ch3</a>
+        <a href="ch04.html">Ch4</a>
+        <a href="ch05.html">Ch5</a>
+        <a href="ch06.html">Ch6</a>
+        <a href="ch07.html">Ch7</a>
+        <a href="ch08.html">Ch8</a>
+        <a href="ch09.html">Ch9</a>
+        <a href="ch10.html">Ch10</a>
+        <a href="ch11.html" class="active">Ch11</a>
+        <a href="ch12.html">Ch12</a>
+      </nav>
+    </header>
+    <main>
+      <h1>Ch11. Stream Processing</h1>
+      <p class="subtitle">
+        batch의 인위적 경계(고정·유한 입력)를 걷어내고
+        <strong>끝없이 도착하는 불변 event</strong>를 다루는 패러다임 —
+        <strong>message broker</strong>(전통적 → Kafka류 log 기반),
+        <strong>CDC와 event sourcing</strong>, 그리고
+        <strong>시간·join·fault tolerance</strong>의 세계
+      </p>
+
+      <h2>챕터 개요</h2>
+      <p>
+        Chapter 10의 batch processing은 강력하지만 한 가지 가정을 깐다 —
+        <strong>입력이 유한(bounded)하고 고정되어 있다</strong>는 것이다. batch
+        job은 "어제 자정까지의 모든 데이터"처럼 정해진 입력을 읽어 정해진 출력을
+        낸다. 하지만 현실의 데이터는 <strong>끝없이 도착한다</strong> — 사용자는
+        밤낮으로 페이지를 열고 센서는 계속 값을 뿜는다. 하루 단위 batch는 결과를
+        보기까지 최대 하루가 걸리니, 처리 간격을 잘게 쪼개다 보면 결국
+        <strong
+          >고정된 시간 조각이라는 개념 자체를 버리고, 이벤트가 발생할 때마다
+          처리</strong
+        >하는 지점에 다다른다 — 이것이 stream processing이다.
+      </p>
+      <p>
+        이 챕터는 세 부분이다:
+        <strong>Transmitting Event Streams</strong>(event를 producer에서
+        consumer로 나르기 — message broker의 두 패턴, log 기반 broker),
+        <strong>Databases and Streams</strong>(CDC와 event sourcing으로 시스템을
+        동기화하고 불변 log를 진실의 원천으로 삼기),
+        <strong>Processing Streams</strong>(event time vs processing time,
+        windowing, stream join, fault tolerance).
+      </p>
+      <blockquote>
+        핵심 통찰 — <strong>batch와 stream은 대립이 아니라 연속체</strong>다.
+        batch는 bounded stream이고 stream은 unbounded batch다. 불변 event log를
+        진실의 원천으로 두고 거기서 다양한 read view를 파생시킨다는 발상이 이
+        챕터 전체를 관통한다.
+      </blockquote>
+
+      <h2>핵심 개념 정리</h2>
+
+      <h3>왜 stream인가 — batch의 인위적 경계</h3>
+      <p>
+        batch의 입력은 <strong>bounded</strong>하다 — 유한하고 언젠가 끝나므로
+        job이 "언제 다 읽었는지" 안다. 하지만 이 유한성은 데이터를 하루 단위로
+        <strong>인위적으로 잘라낸</strong> 결과일 뿐이다. 실제 데이터는
+        <strong>점진적으로(incrementally)</strong> 도착하는
+        <strong>unbounded</strong> stream이며, daily batch의 문제는 하루의
+        <strong>지연</strong>이다. 처리 주기를 시간→분→초로 쪼개다 보면 고정
+        chunk를 버리고 이벤트마다 처리하게 된다.
+      </p>
+      <p>
+        <strong>event</strong>: stream의 기본 단위 —
+        <strong
+          >어떤 시점에 일어난 일에 대한, 작고 자기완결적(self-contained)이며
+          불변인 record</strong
+        >. 보통 timestamp를 포함하고 텍스트·JSON·binary로 인코딩된다. event를
+        만드는 쪽이 <strong>producer</strong>(publisher), 처리하는 쪽이
+        <strong>consumer</strong>(subscriber)이며, 관련 event를
+        <strong>topic</strong>으로 묶는다.
+      </p>
+
+      <h3>Event stream의 전송 — messaging system</h3>
+      <p>
+        낮은 지연이 목표라면 consumer가 매번 polling하는 것은 비효율적이다 —
+        간격을 좁힐수록 "새 것 없음" 비용이 커진다. 그래서 새 event를
+        <strong>밀어주는(notify)</strong> messaging system이 필요하다. pub/sub
+        모델은 두 질문으로 특징지어진다: ① producer가 빠르면 어떻게 하나(버림 /
+        큐잉 / <strong>backpressure</strong>), ② 노드가 죽으면 event가 유실되나.
+        UDP 멀티캐스트·브로커 없는 방식·webhook 같은
+        <strong>direct producer→consumer</strong>는 단순하지만 consumer의 일시적
+        장애에 취약하고 메시지 유실 위험이 크다.
+      </p>
+      <p>
+        <strong>Message broker</strong>: producer와 consumer 사이에 두는 서버 —
+        사실상 message에 최적화된 데이터베이스다. broker에 데이터가 쌓이므로
+        consumer는 비동기·간헐적이어도 되고, 죽었다 살아나도 놓친 메시지를
+        받는다. 두 가지 소비 패턴:
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>패턴</th>
+            <th>동작</th>
+            <th>용도</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Load balancing</strong><br />(shared subscription)</td>
+            <td>
+              각 메시지를 consumer <strong>하나에게만</strong> 전달, 여럿이 나눠
+              처리
+            </td>
+            <td>처리량 확장 — 메시지 처리가 비쌀 때 병렬화</td>
+          </tr>
+          <tr>
+            <td><strong>Fan-out</strong></td>
+            <td>각 메시지를 <strong>모든</strong> consumer에게 전달</td>
+            <td>여러 독립 consumer가 같은 stream을 각자 소비</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        두 패턴은 조합 가능하다(consumer group 여러 개, 각 group 안에서 load
+        balancing). consumer는 언제든 죽으므로 broker는
+        <strong>acknowledgment</strong>(처리 완료 통지)를 쓴다 — ack 없이 연결이
+        끊기면 <strong>redeliver</strong>한다. 문제: load balancing과 결합되면
+        <strong>메시지 순서가 뒤바뀔 수 있다</strong> — consumer2가 m3를
+        처리하다 죽어 재전달되는 사이 consumer1이 m4, m5를 이미 처리했다면
+        순서가 섞인다.
+      </p>
+
+      <div class="callout">
+        <strong>심층 설명</strong> — log 기반 broker vs 전통적 broker, 그리고
+        replay: 전통적 broker(AMQP/JMS)는 메시지를 소비·ack하면
+        <strong>삭제</strong>한다 — 과거를 다시 읽을 수 없고, 개별 메시지마다
+        ack를 추적한다. Kafka류 <strong>log 기반 broker</strong>는 정반대
+        발상이다 — 디스크의 <strong>append-only log</strong>를 그대로 broker로
+        쓴다. producer는 log 끝에 <strong>append</strong>하고, consumer는 log를
+        <strong>순차적으로</strong> 읽는다(끝에 닿으면 새 메시지를 대기). 확장을
+        위해 log를 <strong>partition</strong>으로 나누며, 한 partition 안에서는
+        <em>순서가 보장</em>되고 각 메시지에 단조 증가하는
+        <strong>offset</strong>이 붙는다. 소비 패턴은 자연히 매핑된다 —
+        fan-out은 consumer들이 서로 독립적으로 log를 읽으면 되고(누구도 지우지
+        않으므로), load balancing은
+        <strong>partition 단위로 consumer group에 분배</strong>한다 (그래서
+        consumer 수 ≤ partition 수, 느린 메시지는 그 partition을 head-of-line
+        blocking하지만 순서는 보존). broker는 개별 ack 대신 consumer가 어디까지
+        읽었는지 <strong>offset 하나만</strong> 기록한다(single-leader DB의 log
+        sequence number와 같은 발상) — 죽으면 마지막 커밋 offset부터 재개하되 그
+        사이 메시지는 재처리될 수 있다. 가장 큰 강점은 <strong>replay</strong>다
+        — 소비해도 지우지 않으므로 offset을 과거로 되돌려
+        <strong>옛 메시지를 다시 소비</strong>할 수 있다(파생 시스템 재생성,
+        코드 수정 후 재처리, 실험). append-only라 디스크가 결국 차므로,
+        <strong>원형 버퍼</strong>로 오래된 segment를 지우거나(느린 consumer가
+        너무 뒤처지면 메시지 유실), key별 최신 값만 남기는
+        <strong>log compaction</strong>으로 log 안에 전체 스냅샷을 유지한다.
+      </div>
+
+      <p>
+        <strong>언제 무엇을 쓰나</strong>: 메시지 처리가 비싸고 메시지별
+        병렬화가 필요하며 순서가 덜 중요하면 전통적(AMQP/JMS) broker가, 처리가
+        빠르고 <strong>순서가 중요</strong>하며
+        <strong>replay가 필요</strong>하면 log 기반 broker가 낫다.
+      </p>
+
+      <h3>데이터베이스와 stream — CDC와 event sourcing</h3>
+      <p>
+        현실에는 OLTP DB, 검색 인덱스, 캐시, 데이터 웨어하우스 등
+        <strong>같은 데이터의 여러 사본</strong>이 공존하고 이들을 일치시켜야
+        한다. 애플리케이션이 각 시스템에 직접
+        <strong>이중 쓰기(dual write)</strong>하는 방식은 위험하다:
+      </p>
+      <ul>
+        <li>
+          <strong>race condition</strong>: 두 클라이언트의 동시 쓰기가 DB에는
+          A→B, 검색 인덱스에는 B→A 순서로 도착해 두 시스템이 영구히 불일치할 수
+          있다.
+        </li>
+        <li>
+          <strong>partial failure</strong>: 한 쓰기는 성공, 다른 쓰기는 실패하면
+          어긋난다 — atomic commit(2PC)으로 막으려면 비싸다.
+        </li>
+      </ul>
+      <p>
+        해법은
+        <strong
+          >하나의 시스템을 진실의 원천(source of truth)인 leader로
+          정하고</strong
+        >
+        나머지를 그 변경 로그를 따라가는 follower로 만드는 것이다.
+        <strong>Change data capture(CDC)</strong>는 DB에 쓰인 모든 변경을 추출해
+        <strong>stream</strong>으로 만들어, 검색 인덱스·캐시·웨어하우스가 같은
+        순서로 적용하게 한다.
+      </p>
+      <table>
+        <thead>
+          <tr>
+            <th>측면</th>
+            <th>내용</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>구현 방식</strong></td>
+            <td>
+              <strong>log 기반 CDC</strong>(replication log/WAL 파싱 —
+              Debezium이 MySQL binlog·Postgres WAL을 읽음) vs
+              <strong>trigger 기반 CDC</strong>(DB trigger로 변경 기록 —
+              이식성은 좋으나 오버헤드·취약)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>일관성</strong></td>
+            <td>
+              본질적으로 asynchronous — follower가 leader보다 뒤처질 수 있으나
+              dual write의 race·partial failure가 없다(하나의 순서 있는 log)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>초기 스냅샷</strong></td>
+            <td>
+              전체 변경 log를 영원히 못 두므로, 일관된 스냅샷을 먼저 적재하고 그
+              이후 log를 이어 붙임(스냅샷은 log의 알려진 offset에 대응)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>log compaction</strong></td>
+            <td>
+              key별 최신 값만 남기면 log 하나로 DB 스냅샷 재구성 — 새 follower를
+              스냅샷 없이 log 처음부터 생성 가능
+            </td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout">
+        <strong>심층 설명</strong> — CDC와 event sourcing의 관계·차이: 둘 다
+        "변경을 순서 있는 log로 흘린다"는 발상을 공유하지만
+        <strong>추상화 수준이 다르다</strong>. <strong>CDC</strong>는 DB의
+        <em>저수준 상태 변경</em>을 추출한다 — 이 event는 mutable하다(같은 row가
+        나중에 UPDATE로 덮이므로), 그래서 로그를 영구 보관할 필요는 없고 파생
+        시스템 동기화가 목적이다. <strong>event sourcing</strong>은
+        애플리케이션이 스스로 상태 변경을
+        <em>애플리케이션 수준의 불변 event</em>("학생이 수업에서 취소함")로
+        append-only log에 기록한다 — 여기서는
+        <strong>log 자체가 진실</strong>이고, 현재 상태는 event를
+        <strong>재생(replay)</strong>해 계산한다(매번 전부 재생은 비싸니
+        스냅샷을 캐시). 중요한 구별: <strong>command vs event</strong> —
+        사용자의 요청은 처음엔 <em>command</em>(검증 대상, 실패 가능)지만,
+        검증을 통과하면 되돌릴 수 없는 사실인 <em>event</em>가 되어 log에
+        들어간다. event는 이미 확정된 사실이므로 consumer가 재생 시 실패해서는
+        안 된다(검증은 command 단계에서 끝냈어야 한다). 이 발상을 밀고 나가면
+        <strong>불변 event log가 진실의 원천이고 현재 상태는 파생 view</strong
+        >라는 결론에 이른다 — 회계 장부처럼 잘못은 지우지 않고 정정 event를
+        덧붙이며, 하나의 log에서 질의 패턴별로 최적화된 여러 read view를
+        파생시킨다. 이것이 <strong>CQRS</strong>(Command Query Responsibility
+        Segregation)다.
+      </div>
+
+      <p>
+        <strong>State, streams, immutability의 장단점</strong>: 장점 —
+        감사·디버깅에 유리(완전한 이력), 과거 상태 재구성, 새 view 소급 생성,
+        버그로 잘못 쓴 view를 log에서 재구성해 복구. 한계 — log가 무한히 자라
+        <strong>compaction</strong>이 필요하고, 불변성은
+        <strong>삭제 요구(GDPR "잊힐 권리")</strong>와 충돌한다(진짜 삭제는
+        log에서 실제로 지워야 하므로 — 암호화 키 파기 등 — 간단치 않다).
+      </p>
+
+      <h3>stream의 처리 — 용도</h3>
+      <ul>
+        <li>
+          <strong>Complex event processing (CEP)</strong>: SQL 같은 질의로 event
+          <strong>패턴</strong>을 기술하고, 맞으면 complex event를 발생 — DB와
+          뒤집힌 관계(질의가 오래 머물고 데이터가 흘러 지나간다). 사기 탐지 등.
+        </li>
+        <li>
+          <strong>Stream analytics</strong>: 개별 event보다 window 단위
+          <strong>집계·통계</strong>(rate·평균·백분위)에 관심 — 근사
+          알고리즘(HyperLogLog, Bloom filter)을 자주 쓴다.
+        </li>
+        <li>
+          <strong>Materialized view 유지</strong>: 캐시·검색 인덱스·웨어하우스를
+          최신으로(CDC·event sourcing과 이어짐).
+        </li>
+        <li>
+          <strong>Search on streams</strong>: 미리 등록한 질의에 흘러오는 문서를
+          매칭(미디어 모니터링, 부동산 알림).
+        </li>
+        <li>
+          <strong>actor framework와 구별</strong>: actor는 동시성·분산 실행의
+          메커니즘이지 데이터 파이프라인 도구가 아니다(전달·순서 보장이 다름).
+        </li>
+      </ul>
+
+      <div class="callout">
+        <strong>심층 설명</strong> — event time vs processing time과 windowing:
+        stream 처리에서 시간은 미묘하다. <strong>event time</strong>은 event가
+        실제 일어난 시각(device의 clock), <strong>processing time</strong>은
+        처리기가 그 event를 본 시각(server의 clock)이며, 둘은 큐잉·네트워크
+        지연·재처리로 크게 벌어진다.
+        <strong>processing time으로 window를 나누면</strong>
+        처리 지연(재시작 후 밀린 event 몰림)이 실제 event rate 변화처럼
+        <strong>거짓 패턴</strong>으로 나타나므로, 정확하려면 event time으로
+        나눠야 한다. 그런데 event time 기반은 <strong>straggler 문제</strong>를
+        낳는다 — "이 window의 event가 이제 다 왔다"고 확신할 수 없다(늦게 오는
+        event가 있을 수 있다). 해법은 window를 언제 닫을지
+        <strong>timeout</strong>을 두고, 그 후 도착한 straggler는
+        <strong>무시(drop)</strong>하거나 이미 낸 결과를
+        <strong>정정(correction)</strong>하는 것이다. 게다가 device clock을 못
+        믿을 때(mobile)는 event에 세 timestamp — ① device의 발생 시각, ②
+        device가 보낸 시각, ③ 서버가 받은 시각 — 를 실어, ②·③ 차이로 device
+        clock offset을 추정해 ①을 보정한다. window 종류:
+        <strong>tumbling</strong>(고정 길이·비겹침),
+        <strong>hopping</strong>(고정 길이·겹침 허용),
+        <strong>sliding</strong>(고정 경계 없이 이동),
+        <strong>session</strong>(비활동 gap으로 구분, 가변 길이).
+      </div>
+
+      <h3>Stream join</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>join</th>
+            <th>설명</th>
+            <th>예</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Stream-stream</strong><br />(window join)</td>
+            <td>같은 window 안의 두 stream event를 연결</td>
+            <td>검색 질의 stream + 클릭 stream → CTR 계산</td>
+          </tr>
+          <tr>
+            <td><strong>Stream-table</strong><br />(enrichment)</td>
+            <td>
+              stream event를 DB(table) 정보로 보강 — table을 CDC로 로컬 최신
+              유지
+            </td>
+            <td>활동 event에 사용자 프로필 붙이기</td>
+          </tr>
+          <tr>
+            <td><strong>Table-table</strong><br />(materialized view 유지)</td>
+            <td>두 변경 stream을 join해 join 결과 view를 갱신</td>
+            <td>트위터 타임라인 캐시</td>
+          </tr>
+        </tbody>
+      </table>
+      <p>
+        세 join 모두 <strong>한쪽의 상태가 시간에 따라 변한다</strong>는 문제가
+        있다 — 판매 시점의 세율로 세금을 계산해야 하는데 재처리 시점엔 세율이
+        바뀌었을 수 있다. 데이터 웨어하우스는 이를
+        <strong>slowly changing dimension(SCD)</strong>로 다뤄, 각 버전에 고유
+        식별자를 붙여 <strong>"그때 그 시점"의 값</strong>으로 결정론적 join을
+        한다(재처리 시 재현성 확보).
+      </p>
+
+      <h3>Fault tolerance — exactly-once</h3>
+      <p>
+        batch는 실패한 task를 통째로 재실행하면 되지만(입력 불변, 출력 버리고
+        다시), stream은 입력이 무한이라 "끝까지 처리 후 출력"이 불가능하다.
+        목표는
+        <strong>exactly-once</strong>(더 정확히
+        <strong>effectively-once</strong>) — 장애가 나도 결과가 한 번 처리한
+        것과 같아야 한다.
+      </p>
+      <ul>
+        <li>
+          <strong>microbatching (Spark Streaming)</strong>: stream을 아주 작은
+          batch(예: 1초)로 쪼개 batch의 fault tolerance를 재사용 — 실패 시
+          재실행.
+        </li>
+        <li>
+          <strong>checkpointing (Apache Flink)</strong>: 주기적으로 연산자
+          상태의 일관된 checkpoint를 내구성 저장소에 기록, 장애 시 마지막
+          checkpoint부터 재개.
+        </li>
+        <li>
+          <strong>atomic commit</strong>: microbatch·checkpoint만으로는 부족하다
+          — 재시작하면 checkpoint 이후 출력이 외부로 다시 나갈 수 있다.
+          exactly-once가 되려면 출력·상태 갱신이
+          <strong>원자적으로</strong> 커밋돼야 한다.
+        </li>
+        <li>
+          <strong>idempotence(멱등성)</strong>: 같은 연산을 여러 번 해도 한 번과
+          같은 효과 — offset을 담아 "이미 반영됨"을 표시해 재처리 중복을
+          건너뛴다. 값싼 exactly-once 수단.
+        </li>
+        <li>
+          <strong>상태 재구축</strong>: window·join·집계 상태가 장애 후에도
+          살아남아야 한다 — 원격 복제 또는 로컬 상태 + 변경 log 내구성
+          기록(Flink는 연산자 상태를 스냅샷).
+        </li>
+      </ul>
+
+      <h2>쉬운 예시 / 비유</h2>
+      <div class="card">
+        <h3>Batch vs stream — 사진 앨범 vs 라이브 방송</h3>
+        <p>
+          batch는 "어제까지 찍은 사진을 모아 한 권으로 인화" — 언제 끝났는지
+          알기에 목차가 깔끔하다. stream은 끊기지 않는 <strong>생방송</strong> —
+          "다 모은 다음"이라는 사치가 없다. batch는 그저
+          <strong>끝이 정해진 stream</strong>일 뿐이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Event — 영수증 한 장</h3>
+        <p>
+          event는 "언제 무슨 일이 있었는지" 적은 작은 영수증 — 이미 벌어진
+          일이라 고쳐 쓰지 않고, 정정이 필요하면
+          <strong>새 영수증(취소전표)</strong>을 덧붙인다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Direct messaging의 위험 — 부재중 택배</h3>
+        <p>
+          초인종만 누르고 문 앞에 두고 가는 택배 — 집에 없으면(consumer offline)
+          잃어버린다. broker는 <strong>경비실(택배함)</strong> — 내가 없어도
+          맡아뒀다가 돌아오면 준다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Load balancing vs fan-out — 콜센터 vs 사내 공지</h3>
+        <p>
+          load balancing은 <strong>콜센터</strong> — 전화 하나를 빈 상담원 한
+          명에게만 돌린다. fan-out은 <strong>전 직원 공지 메일</strong> —
+          모두에게 같은 내용이 간다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Ack·redelivery의 순서 뒤섞임 — 회전초밥</h3>
+        <p>
+          손님(consumer)이 접시(m3)를 집다 놓쳐 다시 돌려보내는(redeliver) 사이
+          옆 손님이 이미 뒤 접시(m4, m5)를 집었다 — 원래 순서가 깨진다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Log 기반 broker — 신문 합본 vs 우유 배달</h3>
+        <p>
+          전통적 broker는 <strong>우유 배달</strong> — 마시면(ack) 병이 사라져
+          어제 것을 다시 못 마신다. Kafka는 <strong>신문 축쇄판</strong> —
+          모두가 같은 지면을 <strong>각자의 속도로</strong> 읽고 지난 호를
+          언제든 <strong>다시 펼쳐 본다</strong>(replay). 어디까지 읽었는지는
+          <strong>책갈피(offset)</strong> 하나로 기억한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>CDC — 대표 장부와 필사본</h3>
+        <p>
+          본사 원장(source-of-truth DB)에 기입이 생길 때마다 그
+          <strong>순서 그대로</strong> 지점들(검색 인덱스·캐시)의 필사본에 옮겨
+          적는다. 각자 따로 적어(dual write) 순서가 엇갈리는 사고를 원천
+          차단한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Event sourcing — 장바구니 로그 vs 현재 장바구니</h3>
+        <p>
+          "사과 담음 → 우유 담음 → 사과 뺌"이라는 <strong>행위의 기록</strong>만
+          남기고, "지금 장바구니 = 우유 1개"는 그 기록을
+          <strong>되짚어 계산</strong>한다. 기록이 진실이고 현재 상태는
+          파생물이다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Event time vs processing time — 뒤늦게 도착한 편지</h3>
+        <p>
+          친구가 <strong>1일에 쓴</strong> 엽서(event time)가 파업으로
+          <strong>10일에 도착</strong>(processing time)했다. "이번 주에 받은
+          우편" 으로 세면 왜곡된다 — <strong>엽서에 적힌 날짜</strong>로
+          분류해야 하지만 "1일자 엽서가 이제 다 왔나?"는 확신할 수
+          없다(straggler).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Windowing — 지하철 개찰구 집계</h3>
+        <p>
+          tumbling은 <strong>정각마다 끊는</strong> 시간대별 집계, hopping은
+          <strong>겹쳐 보는</strong> 이동 평균, session은
+          <strong>한 사람이 들어와 나갈 때까지</strong>를 한 묶음(gap이 길면 새
+          세션).
+        </p>
+      </div>
+      <div class="card">
+        <h3>Stream-table join — 명찰 붙이기</h3>
+        <p>
+          출입 기록(stream)이 흘러올 때마다 사원 명부(table)를 뒤져
+          <strong>이름·부서를 덧붙인다</strong>(enrichment). 명부가 자주
+          바뀌므로 매번 원격 조회 대신 명부 변경(CDC)을 받아
+          <strong>로컬 사본을 최신으로</strong> 유지한다.
+        </p>
+      </div>
+      <div class="card">
+        <h3>Exactly-once — 계좌 이체 재시도</h3>
+        <p>
+          송금 요청이 timeout돼 재시도했는데
+          <strong>두 번 빠져나가면</strong> 안 된다. 요청에 고유 번호를 달아
+          "이미 처리됨"으로 거르면(idempotence), 몇 번을 재시도해도
+          <strong>딱 한 번의 효과</strong>만 남는다.
+        </p>
+      </div>
+
+      <h2>핵심 용어 정리 (Glossary)</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>용어</th>
+            <th>정의</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Bounded / Unbounded</strong></td>
+            <td>유한·고정(batch 입력) / 끝없이 점진 도착(stream 입력)</td>
+          </tr>
+          <tr>
+            <td><strong>Event</strong></td>
+            <td>
+              어떤 시점에 일어난 일의 작고 자기완결적인 불변 record — stream의
+              기본 단위
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Producer / Consumer</strong></td>
+            <td>event를 만드는 쪽(publisher) / 처리하는 쪽(subscriber)</td>
+          </tr>
+          <tr>
+            <td><strong>Backpressure</strong></td>
+            <td>producer가 빠를 때 소비 속도에 맞춰 흐름 제어(막음)</td>
+          </tr>
+          <tr>
+            <td><strong>Message broker</strong></td>
+            <td>
+              producer·consumer 사이 서버 — message에 최적화된 DB, 비동기 소비
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Load balancing / Fan-out</strong></td>
+            <td>
+              각 메시지를 하나에게만(병렬 확장) / 모든 consumer에게(독립 소비)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Acknowledgment / Redelivery</strong></td>
+            <td>
+              "처리 완료" 통지 / ack 실패 시 재전달 — load balancing과 결합 시
+              순서 뒤섞임
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Log 기반 broker (Kafka)</strong></td>
+            <td>append-only log를 broker로 — 삭제 대신 보관, replay 가능</td>
+          </tr>
+          <tr>
+            <td><strong>Partition / Offset</strong></td>
+            <td>
+              log를 나눈 조각(안에서만 순서 보장) / 메시지의 단조 증가 위치 번호
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Log compaction</strong></td>
+            <td>
+              key별 최신 값만 남기고 옛 갱신 제거 — log로 전체 스냅샷 유지
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Replay</strong></td>
+            <td>
+              offset을 되돌려 옛 메시지 재소비 — 파생 시스템 재생성·재처리
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Dual write</strong></td>
+            <td>
+              앱이 여러 시스템에 직접 이중 쓰기 — race·partial failure로 불일치
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Change data capture (CDC)</strong></td>
+            <td>DB 변경을 stream으로 추출 — 파생 시스템이 순서대로 추종</td>
+          </tr>
+          <tr>
+            <td><strong>Log 기반 / Trigger 기반 CDC</strong></td>
+            <td>WAL 파싱 / DB trigger로 변경 기록</td>
+          </tr>
+          <tr>
+            <td><strong>Event sourcing</strong></td>
+            <td>
+              앱 상태 변경을 불변 event log로 저장, 현재 상태는 재생으로 파생
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Command vs event</strong></td>
+            <td>검증 대상 요청(실패 가능) vs 확정된 불변 사실(log 기록)</td>
+          </tr>
+          <tr>
+            <td><strong>CQRS</strong></td>
+            <td>
+              command(쓰기)와 query(읽기) 책임 분리 — log에서 질의별 view 파생
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Complex event processing (CEP)</strong></td>
+            <td>오래 머무는 질의로 event 패턴 감지 — DB와 뒤집힌 관계</td>
+          </tr>
+          <tr>
+            <td><strong>Stream analytics</strong></td>
+            <td>window 단위 집계·통계 (근사 알고리즘 활용)</td>
+          </tr>
+          <tr>
+            <td><strong>Event time / Processing time</strong></td>
+            <td>event가 실제 일어난 시각(device) / 처리기가 본 시각(server)</td>
+          </tr>
+          <tr>
+            <td><strong>Straggler</strong></td>
+            <td>window 마감 후 뒤늦게 도착하는 event — 무시하거나 결과 정정</td>
+          </tr>
+          <tr>
+            <td><strong>Tumbling / Hopping / Sliding / Session</strong></td>
+            <td>
+              비겹침 고정 / 겹침 고정 / 이동 / 비활동 gap 기반 가변 window
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Stream-stream / -table / -table join</strong></td>
+            <td>
+              window join / enrichment(CDC로 table 유지) / materialized view
+              유지
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Slowly changing dimension (SCD)</strong></td>
+            <td>
+              시간에 따라 변하는 join 대상 — 버전 식별자로 "그때 그 값" 결정론적
+              join
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Exactly-once / Effectively-once</strong></td>
+            <td>장애가 나도 한 번 처리한 것과 같은 결과</td>
+          </tr>
+          <tr>
+            <td><strong>Microbatching / Checkpointing</strong></td>
+            <td>
+              작은 batch로 쪼갬(Spark Streaming) / 일관 상태 스냅샷(Flink)
+            </td>
+          </tr>
+          <tr>
+            <td><strong>Idempotence</strong></td>
+            <td>여러 번 해도 한 번과 같은 효과 — 값싼 exactly-once 수단</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h2>한 줄 요약</h2>
+      <blockquote>
+        Stream processing은 batch의 인위적 경계(고정·유한 입력)를 걷어내고
+        <strong>끝없이 도착하는 불변 event</strong>를 다루는 패러다임이다 —
+        event를 나르는 <strong>message broker</strong>는 전통적 방식(소비 후
+        삭제)에서
+        <strong>log 기반(Kafka: append-only, offset, replay)</strong>으로
+        진화했고, DB 변경을 흘리는 <strong>CDC</strong>와 앱 event를 진실의
+        원천으로 삼는 <strong>event sourcing</strong>은 불변 log 하나에서 여러
+        read view를 파생(<strong>CQRS</strong>)한다는 통찰로 이어지며, 처리
+        단계에서는 <strong>event time vs processing time</strong>과
+        <strong>windowing</strong> 으로 시간을 다루고,
+        <strong>stream join</strong>의 시간 의존성을 SCD로 통제하며,
+        <strong>microbatching·checkpointing·idempotence</strong>로 exactly-once
+        fault tolerance를 얻는다.
+      </blockquote>
+
+      <h2>퀴즈 (20문제)</h2>
+      <p>문제를 풀면 바로 채점되고 해설이 표시됩니다.</p>
+      <div id="quiz"></div>
+      <div class="footer-nav">
+        <a href="ch10.html">← Ch10. Batch Processing</a
+        ><a href="ch12.html">Ch12. The Future of Data Systems →</a>
+      </div>
+    </main>
+    <script>
+      window.QUIZ_DATA = [
+        {
+          type: "mcq",
+          q: "batch processing의 입력에 대한 설명으로 옳은 것은?",
+          options: [
+            "unbounded하고 점진적으로 도착한다",
+            "bounded(유한·고정)하여 job이 '다 읽었는지'를 알 수 있다",
+            "항상 실시간으로 처리된다",
+            "event 단위로만 구성된다",
+          ],
+          answer: 1,
+          expl: "batch의 입력은 bounded(유한·고정)하여 job이 언제 다 읽었는지 알 수 있고 정렬·집계가 깔끔하다. unbounded·점진적 도착은 stream의 특성이다.",
+        },
+        {
+          type: "mcq",
+          q: "event의 정의로 가장 정확한 것은?",
+          options: [
+            "여러 시스템에 동시에 쓰는 이중 쓰기 연산",
+            "어떤 시점에 일어난 일에 대한, 작고 자기완결적이며 불변인 record",
+            "consumer가 producer에게 보내는 요청",
+            "주기적으로 실행되는 대용량 job",
+          ],
+          answer: 1,
+          expl: "event는 '어떤 시점에 일어난 일'에 대한 작고 자기완결적이며 불변인 record로 보통 timestamp를 포함한다. stream의 기본 단위다.",
+        },
+        {
+          type: "mcq",
+          q: "message broker를 쓰면 direct messaging 대비 얻는 주된 이점은?",
+          options: [
+            "네트워크 대역폭이 줄어든다",
+            "producer와 consumer를 분리해, consumer가 죽었다 살아나도 broker가 보관한 메시지를 받을 수 있다(비동기 소비)",
+            "메시지가 절대 중복되지 않는다",
+            "암호화가 자동으로 적용된다",
+          ],
+          answer: 1,
+          expl: "broker는 producer와 consumer를 decouple하고 데이터를 보관하므로 consumer가 비동기·간헐적이어도 되고 죽었다 살아나도 놓친 메시지를 받는다. 중복 없음·암호화는 보장하지 않는다.",
+        },
+        {
+          type: "mcq",
+          q: "load balancing 패턴과 fan-out 패턴의 차이는?",
+          options: [
+            "둘 다 각 메시지를 모든 consumer에게 보낸다",
+            "load balancing은 각 메시지를 consumer 하나에게만(처리량 분산), fan-out은 모든 consumer에게(독립 소비)",
+            "fan-out은 메시지를 하나에게만, load balancing은 전부에게 보낸다",
+            "두 패턴은 함께 쓸 수 없다",
+          ],
+          answer: 1,
+          expl: "load balancing(shared subscription)은 각 메시지를 consumer 하나에게만 보내 처리량을 병렬 확장하고, fan-out은 모든 consumer에게 보내 독립 소비를 시킨다. 둘은 조합 가능하다.",
+        },
+        {
+          type: "mcq",
+          q: "전통적 broker에서 acknowledgment와 redelivery가 load balancing과 결합될 때 생기는 문제는?",
+          options: [
+            "메시지가 암호화되지 않는다",
+            "consumer가 처리 중 죽어 메시지가 재전달되는 사이 다른 consumer가 뒤 메시지를 처리해, 메시지 순서가 뒤바뀔 수 있다",
+            "offset이 사라진다",
+            "broker의 디스크가 즉시 가득 찬다",
+          ],
+          answer: 1,
+          expl: "consumer가 처리 도중 죽어 ack를 못 하면 broker가 재전달하는데, 그 사이 다른 consumer가 뒤 메시지를 이미 처리했다면 순서가 섞인다(m3, m4, m5 뒤바뀜). 인과 의존 메시지에 치명적이다.",
+        },
+        {
+          type: "mcq",
+          q: "log 기반 message broker(Kafka)가 전통적 AMQP/JMS broker와 근본적으로 다른 점은?",
+          options: [
+            "메시지를 소비하면 즉시 삭제한다",
+            "append-only log를 broker로 사용해, 소비해도 메시지를 지우지 않고 consumer가 offset을 되돌려 과거 메시지를 replay할 수 있다",
+            "순서를 전혀 보장하지 않는다",
+            "consumer가 broker에게 각 메시지의 ack를 개별적으로 보낸다",
+          ],
+          answer: 1,
+          expl: "Kafka류는 append-only log 자체를 broker로 쓴다. 소비해도 지우지 않으므로 offset을 되돌려 과거 메시지를 replay할 수 있다. 소비 후 삭제·개별 ack는 전통적 broker의 특성이다.",
+        },
+        {
+          type: "mcq",
+          q: "log 기반 broker에서 consumer의 진행 상태를 추적하는 방식은?",
+          options: [
+            "메시지마다 개별 ack를 기록한다",
+            "consumer group마다 어디까지 읽었는지 offset 하나만 기록한다 — 죽으면 마지막 커밋 offset부터 재개(그 사이 메시지는 재처리될 수 있음)",
+            "처리한 메시지를 즉시 삭제해 남은 것으로 진행을 판단한다",
+            "진행 상태를 추적하지 않는다",
+          ],
+          answer: 1,
+          expl: "개별 ack 대신 consumer group당 offset 하나만 기록한다(single-leader DB의 log sequence number와 같은 발상). 죽으면 마지막 커밋 offset부터 재개하되 그 사이 메시지는 재처리될 수 있다(순서는 유지).",
+        },
+        {
+          type: "mcq",
+          q: "log 기반 broker에서 디스크가 무한히 차는 문제를 다루는 방법으로 옳은 것은?",
+          options: [
+            "소비된 메시지를 즉시 삭제한다",
+            "원형 버퍼로 오래된 segment를 지우거나, log compaction으로 key별 최신 값만 남긴다",
+            "메시지를 압축하지 않고 그대로 둔다",
+            "consumer가 없으면 log를 통째로 비운다",
+          ],
+          answer: 1,
+          expl: "append-only라 디스크가 결국 찬다. 원형 버퍼로 오래된 segment를 지워 bounded 크기를 유지하거나, log compaction으로 key별 최신 값만 남겨 log로 스냅샷을 유지한다.",
+        },
+        {
+          type: "mcq",
+          q: "dual write(애플리케이션이 여러 시스템에 직접 이중 쓰기)의 문제점은?",
+          options: [
+            "메시지가 암호화되지 않는다",
+            "동시 쓰기의 race condition과 부분 실패(partial failure)로 시스템 간 영구 불일치가 생길 수 있다",
+            "항상 원자적으로 커밋된다",
+            "읽기 성능이 저하된다",
+          ],
+          answer: 1,
+          expl: "dual write는 동시 쓰기가 시스템마다 다른 순서로 도착하는 race condition, 한쪽만 성공하는 partial failure로 영구 불일치를 만든다. atomic commit(2PC)으로 막으려면 비싸다.",
+        },
+        {
+          type: "mcq",
+          q: "change data capture(CDC)의 핵심 아이디어는?",
+          options: [
+            "여러 시스템에 동시에 이중 쓰기를 한다",
+            "하나의 DB를 source of truth로 정하고, 그 변경 로그를 stream으로 추출해 파생 시스템들이 같은 순서로 따라가게 한다",
+            "모든 시스템이 서로에게 직접 쓰기를 전파한다",
+            "데이터를 삭제만 추적한다",
+          ],
+          answer: 1,
+          expl: "CDC는 하나의 DB를 source of truth(leader)로 정하고, 모든 변경을 순서 있는 stream으로 추출해 follower들이 같은 순서로 적용하게 한다. dual write의 race·partial failure를 피한다.",
+        },
+        {
+          type: "mcq",
+          q: "event sourcing과 CDC의 관계·차이로 옳은 것은?",
+          options: [
+            "완전히 같은 것이다",
+            "CDC는 DB의 저수준 상태 변경(나중에 덮일 수 있음)을 추출하고, event sourcing은 애플리케이션 수준의 불변 event를 진실의 원천으로 기록한다",
+            "event sourcing은 현재 상태만 저장하고 이력을 남기지 않는다",
+            "CDC는 애플리케이션 event를, event sourcing은 DB WAL을 사용한다",
+          ],
+          answer: 1,
+          expl: "CDC의 event는 DB의 저수준 상태 변경(mutable — 나중에 UPDATE로 덮임)이고, event sourcing의 event는 애플리케이션 의미를 담은 불변 사실이라 log 자체가 진실이며 완전한 이력이 남는다. 추상화 수준이 다르다.",
+        },
+        {
+          type: "mcq",
+          q: "event sourcing에서 command와 event의 구별로 옳은 것은?",
+          options: [
+            "command와 event는 같은 것이다",
+            "command는 검증 대상(실패 가능)이고, 검증을 통과하면 되돌릴 수 없는 사실인 event가 되어 log에 기록된다",
+            "event가 먼저 기록되고 나서 command로 검증한다",
+            "event는 실패할 수 있으므로 consumer가 재생 시 거부할 수 있다",
+          ],
+          answer: 1,
+          expl: "command는 검증 대상이며 실패할 수 있다. 검증을 통과하면 되돌릴 수 없는 사실인 event가 되어 log에 기록되고, 이미 확정된 사실이므로 consumer가 재생 시 실패해서는 안 된다.",
+        },
+        {
+          type: "mcq",
+          q: "immutable event log를 진실의 원천으로 삼는 접근(CQRS)의 장점이 아닌 것은?",
+          options: [
+            "하나의 log에서 질의 패턴별로 최적화된 여러 read view를 파생할 수 있다",
+            "감사·디버깅에 유리하고 과거 상태를 재구성할 수 있다",
+            "잘못 만든 view를 log에서 다시 만들어 복구할 수 있다",
+            "GDPR '잊힐 권리'에 따른 실제 삭제가 자동으로 쉬워진다",
+          ],
+          answer: 3,
+          expl: "나머지는 모두 장점이다. 반면 불변 event log는 GDPR '잊힐 권리'에 따른 실제 삭제와 오히려 충돌한다 — 진짜 삭제는 log에서 실제로 지워야 하므로(암호화 키 파기 등) 간단하지 않다.",
+        },
+        {
+          type: "mcq",
+          q: "event time과 processing time을 구별해야 하는 이유는?",
+          options: [
+            "둘은 항상 같기 때문",
+            "processing time으로 window를 나누면 처리 지연(밀린 event 몰림)이 실제 event rate 변화처럼 거짓 패턴으로 나타나기 때문",
+            "event time은 서버 clock, processing time은 device clock이라서",
+            "시간대(timezone) 변환 때문",
+          ],
+          answer: 1,
+          expl: "둘은 큐잉·네트워크 지연·재처리로 크게 벌어진다. processing time으로 window를 나누면 처리 지연(재시작 후 밀린 event 몰림)이 실제 event rate 변화처럼 거짓 패턴으로 왜곡된다. 참고로 event time이 device clock, processing time이 server clock이다.",
+        },
+        {
+          type: "mcq",
+          q: "stream join 중 stream-table join(enrichment)에서 table을 최신으로 유지하는 방법은?",
+          options: [
+            "매 event마다 원격 DB를 조회한다(다른 방법 없음)",
+            "table의 변경(CDC)을 stream으로 받아 로컬 사본을 최신으로 유지한다",
+            "table을 절대 갱신하지 않는다",
+            "두 stream을 window로 묶는다",
+          ],
+          answer: 1,
+          expl: "매 event마다 원격 조회는 느리다. table의 변경을 CDC stream으로 받아 처리기 로컬에 사본을 두고 최신으로 유지하면 빠르게 enrichment할 수 있다.",
+        },
+        {
+          type: "ox",
+          q: "batch processing은 bounded 입력, stream processing은 unbounded 입력을 다루며, batch는 사실상 '끝이 정해진 stream'으로 볼 수 있다.",
+          answer: true,
+          expl: "batch는 bounded, stream은 unbounded 입력을 다루며, batch는 '끝이 정해진 stream'(반대로 stream은 unbounded batch)으로 볼 수 있다. 둘은 대립이 아니라 연속체다.",
+        },
+        {
+          type: "ox",
+          q: "log 기반 broker에서는 consumer가 메시지를 소비하면 broker가 그 메시지를 즉시 삭제하므로, 과거 메시지를 replay할 수 없다.",
+          answer: false,
+          expl: "정반대다. log 기반 broker는 소비해도 메시지를 지우지 않고 append-only log에 보관하므로 offset을 되돌려 과거 메시지를 replay할 수 있다. 소비 후 삭제는 전통적 broker의 특성이다.",
+        },
+        {
+          type: "ox",
+          q: "stream 처리의 exactly-once(effectively-once)를 값싸게 달성하는 실용적 수단 중 하나는 연산의 idempotence(멱등성)이며, microbatching(Spark Streaming)과 checkpointing(Flink)도 fault tolerance 기법이다.",
+          answer: true,
+          expl: "idempotence는 재처리 중복을 걸러 값싸게 effectively-once에 도달하는 수단이고, Spark Streaming의 microbatching과 Flink의 checkpointing은 대표적 stream fault tolerance 기법이다(다만 출력의 원자적 커밋도 필요).",
+        },
+        {
+          type: "short",
+          q: "window 마감 후에 뒤늦게 도착하는 event를 부르는 말은? (영어 한 단어)",
+          answers: ["straggler", "stragglers"],
+          expl: "straggler(뒤처진 event) — window를 언제 닫을지 timeout을 두고, 그 후 도착한 straggler는 무시(drop)하거나 나중 값으로 이미 낸 결과를 정정(correction)한다.",
+        },
+        {
+          type: "short",
+          q: "시간에 따라 값이 변하는 join 대상(예: 판매 시점의 세율)을 버전 식별자로 구분해 '그때 그 시점'의 값으로 결정론적 join을 하도록 데이터 웨어하우스에서 다루는 개념의 이름은? (영어, 약어도 인정)",
+          answers: ["slowly changing dimension", "scd"],
+          expl: "slowly changing dimension(SCD) — 각 버전에 고유 식별자를 붙여 event가 일어난 '그때 그 시점'의 값으로 결정론적 join을 한다. join의 재현성(fault tolerance·재처리)을 보장한다.",
+        },
+      ];
+    </script>
+    <script src="assets/quiz.js"></script>
+  </body>
+</html>
